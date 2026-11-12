@@ -1,0 +1,252 @@
+.TH UNN 1 "2026-07-14" "unn" "User Commands"
+.SH NAME
+unn \- a small Wayland terminal emulator
+.SH SYNOPSIS
+.B unn
+.RI [ options ]
+.br
+.B unn
+.RI [ options ]
+.B \-e
+.I command
+.RI [ argument ...]
+.br
+.B unn
+.RI [ options ]
+.B \-\-
+.I command...
+.SH DESCRIPTION
+.B unn
+is a Wayland terminal emulator written in Zig and built on Ghostty's terminal
+core.
+With no command-line command or configured command, it starts the program named
+by
+.BR SHELL ,
+falling back to
+.BR /bin/sh .
+.PP
+Commands after
+.B \-e
+are executed directly.
+Commands after
+.B \-\-
+are joined with spaces and passed to
+.BR /bin/sh " " \-c .
+Bare command names without either marker are rejected.
+.SH OPTIONS
+Long options that take a value accept either
+.B "--option value"
+or
+.BR "--option=value" .
+.TP
+.BI \-\-config " path"
+Load
+.I path
+instead of the default configuration file.
+A missing or unreadable file results in default configuration values.
+.TP
+.BI \-e " command" " [argument ...]"
+Execute the command directly without a shell.
+All remaining arguments belong to the command.
+.TP
+.BI \-\-font " family"
+Override the
+.B font-family
+configuration value for this invocation.
+.TP
+.BR \-h , " " \-\-help
+Print usage information and exit.
+.TP
+.BI \-o " key=value"
+Override a configuration value after loading the configuration file.
+This option may be repeated and also accepts the compact form
+.BR \-okey=value .
+Unknown keys and invalid values make the command line invalid.
+See
+.BR unn (5)
+for available keys.
+.TP
+.B \-\-version
+Print the version identifier and exit.
+.TP
+.BI \-\-window-size-chars " columns" x rows
+Set the initial terminal grid size in cells by overriding the
+.B window-width
+and
+.B window-height
+configuration settings.
+Both dimensions must be positive and no greater than 65535; sizes below 10
+columns or 4 rows are raised to that minimum.
+.TP
+.BI \-\-window-size-pixels " width" x height
+Set the initial window size in physical pixels.
+Both dimensions must be positive.
+Takes precedence over the
+.B window-width
+and
+.B window-height
+configuration settings.
+When both size options are given, the last one wins.
+.TP
+.BI \-\-working-directory " directory"
+Start the child in
+.I directory
+by overriding the
+.B working-directory
+configuration setting.
+The directory must exist and be accessible; a relative path is resolved
+against the current directory.
+.TP
+.BI \-\- " command..."
+Join the remaining words with spaces and run the result through
+.BR /bin/sh " " \-c .
+Shell quoting must therefore be supplied as part of those arguments.
+.SH COMMAND SELECTION
+The command-line forms take precedence over the
+.B command
+configuration setting.
+If neither is present,
+.B unn
+uses
+.B SHELL
+and then
+.B /bin/sh
+as fallbacks.
+.PP
+The child environment is inherited except that
+.B TERM
+is set to
+.BR unn .
+.SH TERMINAL COMPATIBILITY
+Unn uses Ghostty's
+.B libghostty-vt
+terminal core and installs its own
+.B unn
+terminfo entry.
+When a remote host does not recognize it, install the local definition there:
+.PP
+.EX
+infocmp -x unn | ssh HOST tic -x -
+.EE
+.SH CONFIGURATION
+The default configuration file is
+.I $XDG_CONFIG_HOME/unn/unn.ini
+or, when
+.B XDG_CONFIG_HOME
+is unset,
+.IR $HOME/.config/unn/unn.ini .
+It is created with a complete default on first run.
+See
+.BR unn (5)
+for syntax and all settings.
+.PP
+Press
+.B Ctrl+Shift+,
+or send
+.B SIGUSR1
+to reload the configuration.
+Command-line
+.B \-o
+overrides are reapplied on every reload.
+Most visual and interaction settings update the running window;
+process-creation settings apply only when a child or window is created.
+.SH KEYBOARD SHORTCUTS
+.TP
+.BR Ctrl++ " or " Ctrl+=
+Increase the font size for this window.
+.TP
+.B Ctrl+-
+Decrease the font size for this window.
+.TP
+.B Ctrl+0
+Reset the runtime font-size override.
+.TP
+.B Ctrl+Shift+,
+Reload the configuration.
+.TP
+.B Ctrl+Shift+C
+Copy the current selection to the clipboard.
+.TP
+.B Ctrl+Shift+G
+Pipe the last OSC 133-delimited command output to the configured
+.BR pipe-command-output .
+.TP
+.B Ctrl+Shift+V
+Paste from the clipboard.
+.TP
+.B Ctrl+Shift+X
+Jump to the next OSC 133 prompt.
+.TP
+.B Ctrl+Shift+Z
+Jump to the previous OSC 133 prompt.
+.TP
+.BR Shift+Up " or " Shift+Down
+Scroll up or down by one terminal line.
+.TP
+.BR Shift+PageUp " or " Shift+PageDown
+Scroll backward or forward by one terminal page.
+.TP
+.BR Shift+Home " or " Shift+End
+Scroll to the top or bottom of the terminal scrollback.
+.PP
+Scrollback shortcuts pass through to applications using the alternate screen.
+.SH POINTER INPUT
+Drag with the left button to select text.
+Hold
+.B Ctrl
+while dragging for a rectangular selection.
+Middle-click pastes the primary selection.
+.PP
+When an application enables terminal mouse reporting, pointer input is sent to
+the application.
+Holding
+.B Shift
+bypasses application mouse reporting for terminal-side selection.
+.PP
+Hold
+.B Ctrl
+and left-click an OSC 8 hyperlink or detected URI to open it.
+Use
+.B Ctrl+Shift
+when the application captures mouse input.
+.PP
+Wheel input is sent as mouse reports when requested by the application.
+On the alternate screen without mouse reporting it is translated to arrow
+keys; otherwise it scrolls the terminal scrollback.
+.SH SIGNALS
+.TP
+.B SIGUSR1
+Reload the configuration file and reapply command-line overrides.
+.SH ENVIRONMENT
+.TP
+.B HOME
+Used for the configuration path when
+.B XDG_CONFIG_HOME
+is unset.
+.TP
+.B SHELL
+Default child command when no command is otherwise configured.
+.TP
+.B TERM
+The inherited value is replaced with
+.B unn
+for the child.
+.TP
+.B XDG_CONFIG_HOME
+Base directory for the configuration file.
+.SH FILES
+.TP
+.I $HOME/.config/unn/unn.ini
+Fallback configuration file.
+.TP
+.I $XDG_CONFIG_HOME/unn/unn.ini
+Default configuration file.
+.SH EXIT STATUS
+Command-line syntax and option-value errors exit with status 2.
+Startup or runtime failures exit nonzero.
+.SH SEE ALSO
+.BR unn (5),
+.BR sh (1)
+.SH BUGS
+Report bugs at
+.IR https://github.com/rockorager/unn/issues .

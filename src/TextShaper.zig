@@ -1,0 +1,375 @@
+//! HarfBuzz text shaping and shaped-run caching for terminal cell runs.
+//!
+//! Keys hold a face and style plus run-relative (cluster, codepoint) pairs, so identical text
+//! reuses results at any screen position without mixing style-sensitive fallback repair.
+
+const TextShaper = @This();
+
+const std = @import("std");
+const c = @import("c");
+const Font = @import("Font.zig");
+
+alloc: std.mem.Allocator,
+font: *Font,
+hb_buf: *c.hb_buffer_t,
+/// HarfBuzz output keyed by face, style, and run content.
+cache: std.StringHashMapUnmanaged([]ShapedGlyph),
+/// Scratch for the current run's cache key.
+key: std.ArrayList(u32),
+/// Cache counters for benchmarks/profiling. Production rendering does not
+/// read these, so they stay deliberately cheap and approximate.
+stats: ShapeStats = .{},
+
+/// Cache entry limit; at ~300 bytes per typical entry the cache tops out
+/// around a few megabytes before it resets.
+const cache_max_entries = 8192;
+
+/// Fallback candidates tried when a cluster shapes to .notdef before accepting the tofu box.
+const max_notdef_retries = 3;
+const key_header_len = 2;
+
+pub const ShapedGlyph = struct {
+    glyph: u32,
+    /// Cell offset from the run start.
+    cluster: u32,
+    /// Face the glyph index belongs to: usually the run's, but differs for clusters repaired
+    /// against a further fallback after shaping to .notdef.
+    face: u16,
+    /// HarfBuzz 26.6 physical pixels. Only cluster origins snap to the grid.
+    x_advance: i32,
+    x_offset: i32,
+    y_offset: i32,
+};
+
+pub const ShapeStats = struct {
+    cache_hits: usize = 0,
+    cache_misses: usize = 0,
+    shaped_cells: usize = 0,
+    cache_clears: usize = 0,
+};
+
+pub fn init(alloc: std.mem.Allocator, font: *Font) !TextShaper {
+    const hb_buf = c.hb_buffer_create() orelse return error.OutOfMemory;
+    if (c.hb_buffer_allocation_successful(hb_buf) == 0) return error.OutOfMemory;
+    return .{
+        .alloc = alloc,
+        .font = font,
+        .hb_buf = hb_buf,
+        .cache = .empty,
+        .key = .empty,
+        .stats = .{},
+    };
+}
+
+pub fn deinit(self: *TextShaper) void {
+    c.hb_buffer_destroy(self.hb_buf);
+    self.clearCache();
+    self.cache.deinit(self.alloc);
+    self.key.deinit(self.alloc);
+    self.* = undefined;
+}
+
+/// Drop all cached shaping results. Must be called when the font (and with it
+/// the face set and metrics) changes.
+pub fn clearCache(self: *TextShaper) void {
+    var it = self.cache.iterator();
+    while (it.next()) |entry| {
+        self.alloc.free(entry.key_ptr.*);
+        self.alloc.free(entry.value_ptr.*);
+    }
+    self.cache.clearRetainingCapacity();
+}
+
+pub fn resetStats(self: *TextShaper) void {
+    self.stats = .{};
+}
+
+pub fn readStats(self: *const TextShaper) ShapeStats {
+    return self.stats;
+}
+
+pub fn beginKey(self: *TextShaper, face_index: u16, style: Font.FaceStyle) !void {
+    self.key.clearRetainingCapacity();
+    try self.key.appendSlice(self.alloc, &.{ face_index, @backingInt(style) });
+}
+
+pub fn appendKeyCodepoints(self: *TextShaper, cluster: u32, cp: u21, grapheme: []const u21) !void {
+    try self.key.appendSlice(self.alloc, &.{ cluster, cp });
+    for (grapheme) |extra| {
+        try self.key.appendSlice(self.alloc, &.{ cluster, extra });
+    }
+}
+
+pub fn keyItems(self: *const TextShaper) []const u32 {
+    return self.key.items;
+}
+
+/// Shape the current key or return its cached result. The slice is owned by this shaper and
+/// stays valid until a later shape call clears a full cache, or `clearCache`/`deinit`.
+pub fn shape(self: *TextShaper, face_index: u16, style: Font.FaceStyle, shaped_cells: usize) ![]const ShapedGlyph {
+    std.debug.assert(self.key.items.len >= key_header_len);
+    std.debug.assert(self.key.items[0] == face_index);
+    std.debug.assert(self.key.items[1] == @backingInt(style));
+    if (self.cache.get(std.mem.sliceAsBytes(self.key.items))) |cached| {
+        // Steady-state rendering overwhelmingly reuses shaped runs. Keeping
+        // the miss path out of line also keeps Renderer.drawRun compact.
+        @branchHint(.likely);
+        self.stats.cache_hits += 1;
+        return cached;
+    }
+    self.stats.cache_misses += 1;
+    self.stats.shaped_cells += shaped_cells;
+    return self.shapeRun(face_index, style);
+}
+
+/// Shape the run with HarfBuzz and cache it under a copy of the key. .notdef clusters are
+/// re-resolved against further fallbacks first. Same slice lifetime as `shape`.
+pub fn shapeRun(self: *TextShaper, face_index: u16, style: Font.FaceStyle) ![]ShapedGlyph {
+    const key = self.key.items;
+    std.debug.assert(key.len >= key_header_len);
+    std.debug.assert(key[0] == face_index);
+    std.debug.assert(key[1] == @backingInt(style));
+    const face = self.font.face(face_index);
+
+    c.hb_buffer_clear_contents(self.hb_buf);
+    var i: usize = key_header_len;
+    while (i + 1 < key.len) : (i += 2) {
+        c.hb_buffer_add(self.hb_buf, key[i + 1], key[i]);
+    }
+    c.hb_buffer_set_content_type(self.hb_buf, c.HB_BUFFER_CONTENT_TYPE_UNICODE);
+    c.hb_buffer_guess_segment_properties(self.hb_buf);
+    face.shape(self.hb_buf);
+
+    var glyph_count: c_uint = 0;
+    const infos = c.hb_buffer_get_glyph_infos(self.hb_buf, &glyph_count);
+    const positions = c.hb_buffer_get_glyph_positions(self.hb_buf, &glyph_count);
+
+    var shaped = try self.alloc.alloc(ShapedGlyph, glyph_count);
+    errdefer self.alloc.free(shaped);
+    var has_notdef = false;
+    if (glyph_count > 0) {
+        for (shaped, infos[0..glyph_count], positions[0..glyph_count]) |*sg, info, pos| {
+            sg.* = .{
+                .glyph = info.codepoint,
+                .cluster = info.cluster,
+                .face = face_index,
+                .x_advance = pos.x_advance,
+                .x_offset = pos.x_offset,
+                .y_offset = pos.y_offset,
+            };
+            if (info.codepoint == 0) has_notdef = true;
+        }
+    }
+    if (has_notdef) shaped = try self.repairNotdefClusters(shaped, face_index, style);
+
+    // Full cache: reset wholesale. Terminal content is repetitive enough that
+    // the working set repopulates within a frame or two.
+    if (self.cache.count() >= cache_max_entries) {
+        self.stats.cache_clears += 1;
+        self.clearCache();
+    }
+    const owned_key = try self.alloc.dupe(u8, std.mem.sliceAsBytes(key));
+    errdefer self.alloc.free(owned_key);
+    try self.cache.put(self.alloc, owned_key, shaped);
+    return shaped;
+}
+
+/// Replace .notdef glyphs in a fresh run by re-resolving failing clusters against further
+/// fallbacks and re-shaping each alone; origins snap to cells at draw time, so splices don't
+/// disturb the rest. On success frees `shaped` and returns the fix; on error the caller keeps
+/// `shaped`. Clusters no candidate can shape keep their .notdef.
+fn repairNotdefClusters(
+    self: *TextShaper,
+    shaped: []ShapedGlyph,
+    face_index: u16,
+    style: Font.FaceStyle,
+) ![]ShapedGlyph {
+    const key = self.key.items;
+    var out: std.ArrayList(ShapedGlyph) = .empty;
+    errdefer out.deinit(self.alloc);
+    var cps: std.ArrayList(u21) = .empty;
+    defer cps.deinit(self.alloc);
+    // Clusters already replaced, in case HarfBuzz reordered one into
+    // non-contiguous groups; later fragments are dropped.
+    var repaired: std.ArrayList(u32) = .empty;
+    defer repaired.deinit(self.alloc);
+
+    var i: usize = 0;
+    while (i < shaped.len) {
+        const cluster = shaped[i].cluster;
+        var end = i + 1;
+        var has_notdef = shaped[i].glyph == 0;
+        while (end < shaped.len and shaped[end].cluster == cluster) : (end += 1) {
+            if (shaped[end].glyph == 0) has_notdef = true;
+        }
+        if (std.mem.findScalar(u32, repaired.items, cluster) != null) {
+            i = end;
+            continue;
+        }
+        if (!has_notdef) {
+            try out.appendSlice(self.alloc, shaped[i..end]);
+            i = end;
+            continue;
+        }
+
+        cps.clearRetainingCapacity();
+        var k: usize = key_header_len;
+        while (k + 1 < key.len) : (k += 2) {
+            if (key[k] == cluster) try cps.append(self.alloc, @intCast(key[k + 1]));
+        }
+
+        var fixed = false;
+        if (cps.items.len > 0) {
+            var candidates = self.font.clusterCandidates(cps.items, style);
+            var attempts: usize = 0;
+            while (attempts < max_notdef_retries) {
+                const candidate = candidates.next(self.alloc) orelse break;
+                if (candidate == face_index) continue;
+                attempts += 1;
+                if (try self.shapeClusterWith(candidate, cluster, cps.items, &out)) {
+                    fixed = true;
+                    break;
+                }
+            }
+        }
+        if (fixed) {
+            try repaired.append(self.alloc, cluster);
+        } else {
+            try out.appendSlice(self.alloc, shaped[i..end]);
+        }
+        i = end;
+    }
+
+    const result = try out.toOwnedSlice(self.alloc);
+    self.alloc.free(shaped);
+    return result;
+}
+
+/// Shape `cps` as one isolated cluster with `face_index`, appending glyphs to `out`.
+/// Returns false (leaving `out` untouched) if the result still has .notdef.
+fn shapeClusterWith(
+    self: *TextShaper,
+    face_index: u16,
+    cluster: u32,
+    cps: []const u21,
+    out: *std.ArrayList(ShapedGlyph),
+) !bool {
+    const face = self.font.face(face_index);
+    c.hb_buffer_clear_contents(self.hb_buf);
+    for (cps) |cp| c.hb_buffer_add(self.hb_buf, cp, cluster);
+    c.hb_buffer_set_content_type(self.hb_buf, c.HB_BUFFER_CONTENT_TYPE_UNICODE);
+    c.hb_buffer_guess_segment_properties(self.hb_buf);
+    face.shape(self.hb_buf);
+
+    var glyph_count: c_uint = 0;
+    const infos = c.hb_buffer_get_glyph_infos(self.hb_buf, &glyph_count);
+    const positions = c.hb_buffer_get_glyph_positions(self.hb_buf, &glyph_count);
+    for (infos[0..glyph_count]) |info| {
+        if (info.codepoint == 0) return false;
+    }
+
+    const start = out.items.len;
+    errdefer out.shrinkRetainingCapacity(start);
+    for (infos[0..glyph_count], positions[0..glyph_count]) |info, pos| {
+        try out.append(self.alloc, .{
+            .glyph = info.codepoint,
+            .cluster = cluster,
+            .face = face_index,
+            .x_advance = pos.x_advance,
+            .x_offset = pos.x_offset,
+            .y_offset = pos.y_offset,
+        });
+    }
+    return true;
+}
+
+test "cache separates identical runs by fallback style" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, .{});
+    defer font.deinit(alloc);
+    var shaper: TextShaper = try .init(alloc, &font);
+    defer shaper.deinit();
+
+    try shaper.beginKey(0, .regular);
+    try shaper.appendKeyCodepoints(0, 'A', &.{});
+    _ = try shaper.shape(0, .regular, 1);
+
+    try shaper.beginKey(0, .bold);
+    try shaper.appendKeyCodepoints(0, 'A', &.{});
+    _ = try shaper.shape(0, .bold, 1);
+
+    try std.testing.expectEqual(@as(usize, 2), shaper.readStats().cache_misses);
+    try std.testing.expectEqual(@as(usize, 0), shaper.readStats().cache_hits);
+}
+
+test "missing glyph repair preserves ownership on allocation failure" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, .{});
+    defer font.deinit(alloc);
+    // A Unicode noncharacter has no fallback face, so repair must retain tofu.
+    try std.testing.expect(!font.face(0).hasCodepoint(0x10ffff));
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing: std.testing.FailingAllocator = .init(alloc, .{
+            .fail_index = fail_index,
+            // Force toOwnedSlice to allocate instead of shrinking in place.
+            .resize_fail_index = 0,
+        });
+        var shaper: TextShaper = try .init(alloc, &font);
+        defer shaper.deinit();
+        try shaper.beginKey(0, .regular);
+        try shaper.appendKeyCodepoints(0, 0x10ffff, &.{});
+        shaper.alloc = failing.allocator();
+
+        const shaped = shaper.shape(0, .regular, 1) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(@as(usize, 0), shaper.cache.count());
+            // A failed repair must leave the shaper usable for the next frame.
+            shaper.alloc = alloc;
+            const retried = try shaper.shape(0, .regular, 1);
+            try std.testing.expectEqual(@as(usize, 1), retried.len);
+            try std.testing.expectEqual(@as(u32, 0), retried[0].glyph);
+            continue;
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 1), shaped.len);
+        try std.testing.expectEqual(@as(u32, 0), shaped[0].glyph);
+        break;
+    }
+}
+
+test "normal and repair shaping retain fractional metrics with identity transform" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 25.25, .{});
+    defer font.deinit(alloc);
+    var shaper: TextShaper = try .init(alloc, &font);
+    defer shaper.deinit();
+    try shaper.beginKey(0, .regular);
+    try shaper.appendKeyCodepoints(0, 'x', &.{0x0301});
+    const face = font.face(0);
+    var delta: c.FT_Vector = .{ .x = -29, .y = 11 };
+    c.FT_Set_Transform(face.ft_face, null, &delta);
+    const shaped = try shaper.shape(0, .regular, 1);
+    var restored: c.FT_Vector = undefined;
+    c.FT_Get_Transform(face.ft_face, null, &restored);
+    try std.testing.expectEqual(delta.x, restored.x);
+    try std.testing.expectEqual(delta.y, restored.y);
+
+    var count: c_uint = 0;
+    const positions = c.hb_buffer_get_glyph_positions(shaper.hb_buf, &count);
+    var has_fraction = false;
+    for (shaped, positions[0..count]) |glyph, pos| {
+        try std.testing.expectEqual(pos.x_advance, glyph.x_advance);
+        try std.testing.expectEqual(pos.x_offset, glyph.x_offset);
+        try std.testing.expectEqual(pos.y_offset, glyph.y_offset);
+        has_fraction = has_fraction or @mod(pos.x_advance, 64) != 0 or @mod(pos.x_offset, 64) != 0 or @mod(pos.y_offset, 64) != 0;
+    }
+    try std.testing.expect(has_fraction);
+    c.FT_Set_Transform(face.ft_face, null, null);
+    var repaired: std.ArrayList(ShapedGlyph) = .empty;
+    defer repaired.deinit(alloc);
+    try std.testing.expect(try shaper.shapeClusterWith(0, 0, &.{ 'x', 0x0301 }, &repaired));
+    try std.testing.expectEqualSlices(ShapedGlyph, shaped, repaired.items);
+}
