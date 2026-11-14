@@ -325,14 +325,13 @@ pub fn create(
 
     var cursor_theme: ?*wl.CursorTheme = null;
     var cursor_surface: ?*wl.Surface = null;
-    if (globals.cursor_shape_manager == null) {
-        cursor_theme = wl.CursorTheme.load(null, 24, shm) catch null;
-        if (cursor_theme != null) {
-            cursor_surface = compositor.createSurface() catch null;
-            if (cursor_surface == null) {
-                cursor_theme.?.destroy();
-                cursor_theme = null;
-            }
+    // Always load: the cursor-shape device can still fail to create later.
+    cursor_theme = wl.CursorTheme.load(null, 24, shm) catch null;
+    if (cursor_theme != null) {
+        cursor_surface = compositor.createSurface() catch null;
+        if (cursor_surface == null) {
+            cursor_theme.?.destroy();
+            cursor_theme = null;
         }
     }
     errdefer if (cursor_surface) |value| value.destroy();
@@ -654,10 +653,16 @@ fn applyCursorShape(self: *Window) void {
     const surface = self.cursor_surface orelse return;
     const cursor = theme.getCursor(cursorName(self.cursor_shape)) orelse
         theme.getCursor("default") orelse
-        theme.getCursor("left_ptr") orelse return;
+        theme.getCursor("left_ptr") orelse {
+        log.warn("cursor theme has no image for {s}", .{cursorName(self.cursor_shape)});
+        return;
+    };
     if (cursor.image_count == 0) return;
     const image = cursor.images[0];
-    const buffer = image.getBuffer() catch return;
+    const buffer = image.getBuffer() catch |err| {
+        log.warn("cursor image buffer failed: {}", .{err});
+        return;
+    };
     surface.attach(buffer, 0, 0);
     if (surface.getVersion() >= wl.Surface.damage_buffer_since_version)
         surface.damageBuffer(0, 0, @intCast(image.width), @intCast(image.height))
@@ -1198,6 +1203,7 @@ fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, self: *Window) void {
                 self.cursor_shape_device = null;
                 destroyPointer(self.pointer.?);
                 self.pointer = null;
+                self.pointer_enter_serial = null;
             }
         },
         .name => {},
