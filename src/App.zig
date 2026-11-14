@@ -1,0 +1,7066 @@
+//! The live terminal app: owns the terminal, PTY, renderer and window, and runs the event loop.
+//!
+//! The loop polls the Wayland display and the read pipeline's eventfd; PTY output feeds the
+//! terminal and schedules a redraw, throttled by the window's frame callbacks.
+
+const App = @This();
+
+const std = @import("std");
+const posix = std.posix;
+const build_options = @import("build_options");
+const c = @import("c");
+const wayland = @import("wayland");
+const wl = wayland.client.wl;
+const zwp = wayland.client.zwp;
+const vt = @import("ghostty-vt");
+const Clipboard = @import("Clipboard.zig");
+const KittyClipboard = @import("KittyClipboard.zig");
+const KittyDrag = @import("KittyDrag.zig");
+const DragIcon = @import("DragIcon.zig");
+const drag_preview = @import("drag_preview.zig");
+const Config = @import("Config.zig");
+const CommandNotification = @import("CommandNotification.zig");
+const keybind = @import("keybind.zig");
+const Font = @import("Font.zig");
+const Keyboard = @import("Keyboard.zig");
+const Link = @import("Link.zig");
+const Pty = @import("Pty.zig");
+const ReadPipeline = @import("ReadPipeline.zig");
+const Renderer = @import("Renderer.zig");
+const AsyncRaster = @import("AsyncRaster.zig");
+const AsyncJobSnapshot = @import("AsyncJobSnapshot.zig");
+const FrameDamageTracker = @import("FrameDamageTracker.zig");
+const KittyImageCache = @import("KittyImageCache.zig");
+const ScrollDetector = @import("ScrollDetector.zig");
+const TerminalLayout = @import("TerminalLayout.zig");
+const DbusConnection = @import("dbus/Connection.zig");
+
+/// Session-bus connection handle; `void` when D-Bus is compiled out (`-Ddbus=false`).
+const DbusHandle = if (build_options.enable_dbus) ?DbusConnection else void;
+const no_dbus: DbusHandle = if (build_options.enable_dbus) null else {};
+const clipboard_format = @import("clipboard_format.zig");
+const svg = @import("svg.zig");
+const Window = @import("Window.zig");
+
+const log = std.log.scoped(.app);
+
+const HoveredLink = struct {
+    uri: []u8,
+    range: ?Renderer.LinkRange,
+};
+
+const LinkAction = enum { open, copy };
+
+const LinkPress = struct {
+    uri: []u8,
+    cell: vt.Coordinate,
+    button: u32,
+    action: LinkAction,
+};
+
+/// A left press that may become a Kitty drag-out gesture.
+const DragPress = struct {
+    serial: u32,
+    x: f64,
+    y: f64,
+    /// Whether the gesture crossed the threshold and asked the client.
+    requested: bool = false,
+};
+
+/// Logical pixels the pointer must travel before a press becomes a drag.
+const drag_threshold = 8;
+
+const PendingDbus = struct {
+    serial: u32,
+    deadline_ns: i96,
+    kind: Kind,
+
+    const Kind = union(enum) {
+        notification,
+        color_scheme,
+        reduced_motion,
+        open_uri: struct { uri: []u8, token: ?[:0]u8 },
+
+        fn deinit(kind: Kind, alloc: std.mem.Allocator) void {
+            if (kind == .open_uri) {
+                alloc.free(kind.open_uri.uri);
+                if (kind.open_uri.token) |token| alloc.free(token);
+            }
+        }
+    };
+};
+
+alloc: std.mem.Allocator,
+io: std.Io,
+config_arena: std.heap.ArenaAllocator,
+config: Config,
+config_path: ?[:0]const u8,
+config_overrides: []const []const u8,
+environ: std.process.Environ,
+term: vt.Terminal,
+stream: AppStream,
+/// The one terminal snapshot both render paths draw from. Only updated on the main
+/// thread while no render target is checked out, so the async worker reads it lock-free.
+render_state: vt.RenderState,
+/// Pixel offset paired with render_state, including during synchronized output.
+render_scroll_offset: u31 = 0,
+/// Main-thread scratch for recognizing viewport movement before
+/// RenderState.update consumes Ghostty's row dirtiness.
+scroll_detector: ScrollDetector,
+async_raster: ?AsyncRaster,
+async_raster_loader: ?AsyncRaster.Loader,
+async_generation: u64,
+/// The next async snapshot must be rebuilt completely because renderer-only
+/// state changed or a prior snapshot was rendered but not committed.
+async_force_full: bool,
+/// A finished async frame waiting on the frame callback before it can be committed.
+/// `window.rendering_pending` stays true while held, so no new render starts.
+held_frame: ?*Window.Buffer,
+/// Owned overlay and Kitty inputs for the in-flight async job.
+async_job: AsyncJobSnapshot,
+/// Pinned copies of kitty image data shared between consecutive async
+/// jobs, so the worker never reads terminal-owned image bytes.
+kitty_cache: KittyImageCache,
+/// The window geometry changed, so a repaint at the new size must
+/// happen even while synchronized output has content frames frozen.
+geometry_redraw: bool,
+frame_damage: FrameDamageTracker,
+pty: Pty,
+/// Gather-thread pipeline draining the pty master; the main loop
+/// consumes parsed batches via its ready_fd in the poll set.
+pipeline: ReadPipeline,
+child_pid: posix.pid_t,
+font: Font,
+/// The physical pixel size the font is currently loaded at.
+font_size_px: f64,
+/// Runtime-only size override from keyboard shortcuts, preserving the
+/// configured point or logical-pixel unit.
+runtime_font_size: ?Config.FontSize,
+/// Current physical grid rectangle and effective padding.
+layout: TerminalLayout,
+/// Selection highlight colors, from config or OSC 17/19. Snapshotted
+/// into the raster worker's renderer on (re)configure.
+selection_bg: vt.color.RGB,
+selection_fg: ?vt.color.RGB,
+selection_bg_override: ?vt.color.RGB,
+selection_fg_override: ?vt.color.RGB,
+/// Configured cursor fill when OSC 12 has not set a VT cursor color.
+cursor_color: Config.TerminalColor,
+/// Configured text color beneath a focused block cursor.
+cursor_text: ?Config.TerminalColor,
+window: *Window,
+keyboard: Keyboard,
+/// Terminal contents changed since the last committed frame.
+needs_redraw: bool,
+/// Keyboard focus state; unfocused windows draw a hollow cursor.
+focused: bool,
+ime_focused: bool,
+ime_preedit: ?[]u8,
+ime_pending_preedit: ?[]u8,
+ime_pending_commit: ?[]u8,
+/// Cached DEC mode 2048 state, to detect the application enabling in-band size reports.
+in_band_reports: bool,
+/// Cached DEC mode 2026 state, to detect synchronized output boundaries.
+sync_output: bool,
+/// PTY input not yet written. The master is nonblocking so a child that stopped
+/// reading can't deadlock us; flushed when the master polls writable.
+write_queue: std.ArrayList(u8),
+/// Consumed prefix, reclaimed on drain or amortized compaction at enqueue.
+write_queue_offset: usize = 0,
+/// The child has exited and been reaped (via SIGCHLD).
+child_exited: bool,
+/// Session bus connection, used for notifications and future desktop settings.
+/// `void` when built with `-Ddbus=false`.
+/// Connected after the first frame (startDbus) so it stays off the startup path.
+dbus: DbusHandle,
+dbus_started: bool = false,
+dbus_fd: posix.fd_t,
+pending_dbus: std.ArrayList(PendingDbus) = .empty,
+/// URI held while the compositor creates a token for activating its handler.
+pending_open_uri: ?[]u8,
+/// A null value means the notification is awaiting its activation token.
+notifications: std.AutoHashMapUnmanaged(u32, ?[]u8),
+command_notification: CommandNotification = .{},
+color_scheme: vt.device_status.ColorScheme,
+/// Standardized XDG desktop preference; scrollbar dismissal snaps instead
+/// of fading when motion should be reduced.
+reduced_motion: bool,
+/// signalfd for process-local signals, polled in the event loop.
+signal_fd: posix.fd_t,
+/// Key repeat: timerfd armed while a repeating key is held.
+repeat_fd: posix.fd_t,
+repeat_keycode: ?u32,
+/// From wl_keyboard.repeat_info: characters per second and delay in ms.
+repeat_rate: i32,
+repeat_delay: i32,
+/// Scroll animation timer: kinetic touchpad scrolling after a finger-axis
+/// sequence stops, and eased wheel scrolling. Armed while either is active.
+fling_fd: posix.fd_t,
+fling_active: bool,
+fling_velocity: f64,
+/// Logical content pixels of wheel movement not yet eased onto the viewport.
+wheel_scroll_pixels: f64,
+scroll_velocity: f64,
+last_scroll_time_ms: ?u32,
+/// Safety timer for DEC mode 2026 synchronized output.
+sync_output_fd: posix.fd_t,
+/// Timer for ghostty-vt selection autoscroll while dragging past an edge.
+selection_autoscroll_fd: posix.fd_t,
+/// One-shot timer that clears stale OSC 9;4 taskbar progress.
+taskbar_progress_fd: posix.fd_t,
+/// One-shot visibility delay followed by periodic scrollbar fade ticks.
+scrollbar_fd: posix.fd_t,
+/// One-shot wake for the next libghostty Kitty animation frame.
+kitty_animation_fd: posix.fd_t,
+/// Idle scheduler for incremental cold scrollback compression.
+compression_fd: posix.fd_t,
+compression_activity: u64,
+scrollbar_alpha: u8,
+scrollbar_fading: bool,
+scrollbar_fade_elapsed_ms: u16,
+scrollbar_reveal_hovered: bool,
+scrollbar_hovered: bool,
+scrollbar_drag: ?ScrollbarDrag,
+/// Pointer position in logical surface coordinates.
+pointer_x: f64,
+pointer_y: f64,
+pointer_inside: bool,
+/// Demand-driven link detection cache. The URI is owned by App.
+hovered_link: ?HoveredLink,
+link_checked_cell: ?vt.Coordinate,
+link_active: bool,
+/// A link click acts only if release occurs over the original cell.
+link_press: ?LinkPress,
+drag_press: ?DragPress,
+/// Wheel state accumulated between pointer frame events.
+scroll_pixels: f64,
+/// Physical pixels cropped from the top row; always less than cell_height.
+scroll_offset: u31 = 0,
+scroll_frame_pixels: f64,
+scroll_clicks: i32,
+scroll_value120: i32,
+scroll_line_remainder: f64,
+scroll_target: ScrollTarget,
+scroll_source: wl.Pointer.AxisSource,
+scroll_time_ms: u32,
+scroll_had_pixels: bool,
+scroll_had_discrete: bool,
+scroll_had_value120: bool,
+scroll_stop_time_ms: ?u32,
+/// True while the left button is down for terminal-side selection.
+selecting: bool,
+/// True when the active drag should produce a rectangular selection.
+selection_rectangle: bool,
+selection_gesture: vt.SelectionGesture,
+/// Button press currently owned by application mouse reporting.
+mouse_button: ?vt.input.MouseButton,
+/// True after OSC 22 explicitly set the pointer shape; otherwise mouse
+/// reporting uses an arrow and normal terminal selection uses I-beam.
+mouse_shape_explicit: bool,
+/// Active screen at the last check, to detect alt screen switches.
+active_screen: vt.ScreenSet.Key,
+/// Serial of the most recent input event, required to claim selections.
+last_serial: u32,
+clipboard: Clipboard,
+kitty_clipboard: KittyClipboard,
+kitty_drag: KittyDrag,
+const selection_word_boundaries = [_]u21{
+    0,   ' ', '\t', '\'', '"',
+    '│',
+    '`', '|', ':',  ';',  ',',
+    '(', ')', '[',  ']',  '{',
+    '}', '<', '>',  '$',
+};
+
+/// Terminal lines per wheel click.
+const initial_cols = 80;
+const initial_rows = 24;
+const app_name = "unn";
+const sync_output_reset_ms = 1000;
+const taskbar_progress_timeout_seconds = 15;
+const selection_repeat_ms = 500;
+const selection_autoscroll_ms = 15;
+const scrollbar_hold_ms = 700;
+// Fluent durationFast with curveAccelerateMin for a small exiting overlay.
+const scrollbar_fade_duration_ms = 150;
+const scrollbar_fade_interval_ms = 15;
+const compression_idle_ms = 250;
+const compression_step_ms = 1;
+const scrollbar_default_alpha = 150;
+const scrollbar_hover_alpha = 220;
+const scrollbar_width = 6;
+const scrollbar_inset = 3;
+const scrollbar_min_thumb = 24;
+const scrollbar_hit_width = 14;
+const scrollbar_reveal_width = 24;
+const disarmed_timer: std.os.linux.itimerspec = .{
+    .it_value = .{ .sec = 0, .nsec = 0 },
+    .it_interval = .{ .sec = 0, .nsec = 0 },
+};
+/// Preserve Unn's Wayland precision-scroll normalization before applying
+/// the user-facing Ghostty-compatible multiplier.
+const wayland_precision_scroll_scale = 3.0;
+/// Kinetic scroll tuning, matching Keywork's touchpad fling behavior.
+const fling_decay_per_ms = 0.998;
+const fling_interval_ms = 8;
+const fling_start_velocity = 150.0;
+const fling_min_velocity = 30.0;
+const fling_max_velocity = 8000.0;
+/// Wheel easing time constant; a three-row detent settles in about 120 ms.
+const wheel_scroll_time_constant_ms = 25.0;
+const velocity_smoothing = 0.75;
+const scroll_velocity_timeout_ms = 200;
+
+const ScrollTarget = enum { viewport, keys, application };
+
+const ScrollbarDrag = struct {
+    grab_offset: f64,
+    screen: vt.ScreenSet.Key,
+};
+
+const ScrollbarGeometry = struct {
+    thumb: Renderer.ScrollbarThumb,
+    track_y: u31,
+    travel: u31,
+    max_offset: usize,
+};
+
+pub const InitialSize = union(enum) {
+    default,
+    chars: struct { cols: u16, rows: u16 },
+};
+
+pub const InitOptions = struct {
+    config_path: ?[:0]const u8 = null,
+    config_overrides: []const []const u8 = &.{},
+    working_directory: ?[:0]const u8 = null,
+    initial_size: InitialSize = .default,
+};
+
+const StartupSize = struct {
+    cols: u16,
+    rows: u16,
+    window: Window.InitialSize,
+};
+
+fn initialTerminalSize(size: InitialSize, font: *const Font, config: Config) StartupSize {
+    const padding = physicalPadding(config, 120);
+    return switch (size) {
+        .default => .{
+            .cols = initial_cols,
+            .rows = initial_rows,
+            .window = .{},
+        },
+        .chars => |chars| .{
+            .cols = chars.cols,
+            .rows = chars.rows,
+            .window = .{
+                .width = dimensionForCells(chars.cols, font.cell_width, padding.left, padding.right),
+                .height = dimensionForCells(chars.rows, font.cell_height, padding.top, padding.bottom),
+            },
+        },
+    };
+}
+
+fn dimensionForCells(cells: u16, cell_size: u31, before: u31, after: u31) u31 {
+    return @intCast(@min(
+        std.math.maxInt(u31),
+        @as(u64, cells) * cell_size + before + after,
+    ));
+}
+
+const TerminalHandler = vt.TerminalStream.Handler;
+const AppStream = vt.Stream(AppStreamHandler);
+
+const AppStreamHandler = struct {
+    app: *App,
+    terminal_handler: TerminalHandler,
+
+    pub fn deinit(self: *AppStreamHandler) void {
+        self.terminal_handler.deinit();
+    }
+
+    pub fn vt(
+        self: *AppStreamHandler,
+        comptime action: AppStream.Action.Tag,
+        value: AppStream.Action.Value(action),
+    ) void {
+        // Clipboard reads are async on Wayland: keep libghostty's parsing but route both
+        // clipboard protocols through our poll loop instead of its synchronous effect contract.
+        switch (action) {
+            .clipboard_contents, .kitty_clipboard => {},
+            // libghostty implements only drops and refuses drag-out.
+            .kitty_dnd => if (!self.app.handleKittyDrag(value)) self.terminal_handler.vt(action, value),
+            else => self.terminal_handler.vt(action, value),
+        }
+        switch (action) {
+            .color_operation => self.app.handleOscColorOperation(&value.requests, value.terminator),
+            .kitty_color_report => self.app.answerKittySelectionColorQueries(value),
+            .clipboard_contents => self.app.setOsc52Clipboard(value.kind, value.data),
+            .kitty_clipboard => {
+                self.app.kitty_clipboard.handle(value) catch |err| {
+                    if (err == error.QueueFull) {
+                        const response = self.app.kitty_clipboard.rejection();
+                        self.app.writeKittyClipboardStatus(response.op, response.id, response.terminator, .EBUSY);
+                    } else {
+                        log.warn("failed to handle OSC 5522 command: {}", .{err});
+                    }
+                };
+                self.app.pumpKittyClipboard();
+            },
+            .show_desktop_notification => self.app.showDesktopNotification(value.title, value.body),
+            .semantic_prompt => self.app.handleCommandNotification(value),
+            .mouse_shape => {
+                self.app.mouse_shape_explicit = true;
+                self.app.syncCursorShape();
+            },
+            .set_mode => {
+                if (value.mode == .report_color_scheme) self.app.sendColorSchemeReport();
+                if (value.mode == .in_band_size_reports) {
+                    self.app.in_band_reports = true;
+                    self.app.sendSizeReport();
+                }
+                self.app.syncCursorShape();
+            },
+            .restore_mode => {
+                if (value.mode == .report_color_scheme and self.app.term.modes.get(.report_color_scheme)) {
+                    self.app.sendColorSchemeReport();
+                }
+                if (value.mode == .in_band_size_reports) {
+                    const enabled = self.app.term.modes.get(.in_band_size_reports);
+                    self.app.in_band_reports = enabled;
+                    if (enabled) self.app.sendSizeReport();
+                }
+                self.app.syncCursorShape();
+            },
+            .reset_mode => {
+                if (value.mode == .in_band_size_reports) self.app.in_band_reports = false;
+                self.app.syncCursorShape();
+            },
+            .full_reset => {
+                self.app.kitty_clipboard.reset();
+                self.app.kitty_drag.reset();
+                self.app.clipboard.cancelDrag();
+                self.app.mouse_shape_explicit = false;
+                self.app.in_band_reports = false;
+                self.app.syncCursorShape();
+            },
+            else => {},
+        }
+    }
+};
+
+/// Directory for kitty t=t temp files: $TMPDIR, then $TMP, then /tmp.
+/// Slices point into the process environment.
+fn tmpDirPath(environ: std.process.Environ) []const u8 {
+    const dir = environ.getPosix("TMPDIR") orelse
+        environ.getPosix("TMP") orelse
+        return "/tmp";
+    return std.mem.trimEnd(u8, dir, &.{std.fs.path.sep});
+}
+
+/// `argv`/`envp` must outlive the call (the child copies them via execve).
+/// `config` strings must stay valid until the first successful reload or teardown.
+pub fn init(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    config: Config,
+    environ: std.process.Environ,
+    path: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    options: InitOptions,
+) !*App {
+    vt.sys.decode_png = decodePng;
+
+    // Child exit comes from SIGCHLD and config reload from SIGUSR1. Block both and read
+    // them via signalfd; this must precede the fork so an early exit isn't missed.
+    var sigmask = posix.sigemptyset();
+    posix.sigaddset(&sigmask, .CHLD);
+    posix.sigaddset(&sigmask, .USR1);
+    posix.sigprocmask(std.os.linux.SIG.BLOCK, &sigmask, null);
+    const signal_fd = posix.signalfd(
+        -1,
+        &sigmask,
+        std.os.linux.SFD.CLOEXEC | std.os.linux.SFD.NONBLOCK,
+    ) catch return error.SignalFdFailed;
+    errdefer _ = std.os.linux.close(signal_fd);
+
+    // Start the child before font discovery so the shell's init overlaps fontconfig's
+    // cache load. The size is a placeholder until the font metrics are known.
+    const startup_size_hint: posix.winsize = switch (options.initial_size) {
+        .chars => |chars| .{ .row = chars.rows, .col = chars.cols, .xpixel = 0, .ypixel = 0 },
+        else => .{ .row = initial_rows, .col = initial_cols, .xpixel = 0, .ypixel = 0 },
+    };
+    var pty: Pty = try .open(startup_size_hint);
+    errdefer pty.deinit();
+
+    const child_pid = try pty.spawn(path, argv, envp, .{
+        .cwd = if (options.working_directory) |cwd| cwd.ptr else null,
+    });
+
+    // Nonblocking master: a blocking write can deadlock when the child floods output
+    // while we answer queries embedded in it.
+    setNonblocking(pty.master);
+
+    // Font discovery is the costliest startup step; doing it after the fork lets the
+    // child start up meanwhile.
+    const font_size_px = Config.fontSizePixels(config.font_size, 120);
+    var font: Font = try .init(
+        alloc,
+        config.font_family,
+        font_size_px,
+        config.metric_adjustments,
+    );
+    errdefer font.deinit(alloc);
+
+    const startup_size = initialTerminalSize(options.initial_size, &font, config);
+    const startup_padding = physicalPadding(config, 120);
+    const startup_layout = TerminalLayout.init(
+        dimensionForCells(startup_size.cols, font.cell_width, startup_padding.left, startup_padding.right),
+        dimensionForCells(startup_size.rows, font.cell_height, startup_padding.top, startup_padding.bottom),
+        font.cell_width,
+        font.cell_height,
+        startup_padding,
+    );
+
+    // The child was spawned with a placeholder winsize; hand it the real
+    // one now (also delivers SIGWINCH if it already read the old size).
+    try pty.setWinsize(.{
+        .row = startup_size.rows,
+        .col = startup_size.cols,
+        .xpixel = @intCast(startup_size.cols * font.cell_width),
+        .ypixel = @intCast(startup_size.rows * font.cell_height),
+    });
+
+    var colors = try config.terminalColors(alloc);
+    var term: vt.Terminal = vt.Terminal.init(io, alloc, .{
+        .cols = startup_size.cols,
+        .rows = startup_size.rows,
+        .max_scrollback_bytes = config.scrollback_limit,
+        .colors = colors,
+        .default_modes = .{ .grapheme_cluster = true },
+        // libghostty-vt defaults to 10MB, too small for a fullscreen 4K frame (~32MB).
+        // Match the Ghostty app (320MB).
+        .kitty_image_storage_limit = config.image_storage_limit,
+        // Accept every kitty transmission medium, like the Ghostty app. t=s (shm) matters most
+        // for throughput; t=t temp files are only read, then deleted, inside the temp dir.
+        .kitty_image_loading_limits = .allWithTempDir(tmpDirPath(environ)),
+    }) catch |err| {
+        colors.palette.deinit(alloc);
+        return err;
+    };
+    errdefer term.deinit(alloc);
+    try term.resize(alloc, .{
+        .cols = startup_size.cols,
+        .rows = startup_size.rows,
+        .cell_size_px = .{
+            .width = font.cell_width,
+            .height = font.cell_height,
+        },
+    });
+
+    const window = try Window.create(alloc, startup_size.window);
+    errdefer window.destroy();
+    window.setBufferAlpha(config.background_opacity < 255);
+
+    // Timerfds must be nonblocking: disarming clears pending expirations, so a stale
+    // poll revent would otherwise block the loop forever.
+    const repeat_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(repeat_fd);
+
+    const fling_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(fling_fd);
+
+    const sync_output_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(sync_output_fd);
+
+    const selection_autoscroll_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(selection_autoscroll_fd);
+
+    const taskbar_progress_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(taskbar_progress_fd);
+
+    const scrollbar_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(scrollbar_fd);
+
+    const kitty_animation_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(kitty_animation_fd);
+
+    const compression_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(compression_fd);
+
+    // Self-reference into listeners/streams requires a stable address.
+    const self = try alloc.create(App);
+    errdefer alloc.destroy(self);
+    self.* = .{
+        .alloc = alloc,
+        .io = io,
+        .config_arena = .init(alloc),
+        .config = config,
+        .config_path = options.config_path,
+        .config_overrides = options.config_overrides,
+        .environ = environ,
+        .term = term,
+        .stream = undefined, // needs the final Terminal address; set below
+        .render_state = .empty,
+        .scroll_detector = .{},
+        .async_raster = null,
+        .async_raster_loader = null,
+        .async_generation = 1,
+        .async_force_full = true,
+        .held_frame = null,
+        .async_job = .{},
+        .kitty_cache = .empty,
+        .geometry_redraw = false,
+        .frame_damage = .init(alloc),
+        .pty = pty,
+        .pipeline = try .init(pty.master),
+        .child_pid = child_pid,
+        .font = font,
+        .font_size_px = font_size_px,
+        .runtime_font_size = null,
+        .layout = startup_layout,
+        .selection_bg = config.effectiveSelectionBackground(),
+        .selection_fg = config.effectiveSelectionForeground(),
+        .selection_bg_override = null,
+        .selection_fg_override = null,
+        .cursor_color = config.effectiveCursorColor(),
+        .cursor_text = config.effectiveCursorText(),
+        .window = window,
+        .keyboard = try .init(),
+        .needs_redraw = true,
+        .focused = true,
+        .ime_focused = false,
+        .ime_preedit = null,
+        .ime_pending_preedit = null,
+        .ime_pending_commit = null,
+        .in_band_reports = false,
+        .sync_output = false,
+        .write_queue = .empty,
+        .child_exited = false,
+        .dbus = no_dbus,
+        .dbus_fd = -1,
+        .pending_open_uri = null,
+        .notifications = .empty,
+        .color_scheme = .dark,
+        .reduced_motion = false,
+        .signal_fd = signal_fd,
+        .repeat_fd = repeat_fd,
+        .repeat_keycode = null,
+        .repeat_rate = 25,
+        .repeat_delay = 600,
+        .fling_fd = fling_fd,
+        .fling_active = false,
+        .fling_velocity = 0,
+        .wheel_scroll_pixels = 0,
+        .scroll_velocity = 0,
+        .last_scroll_time_ms = null,
+        .sync_output_fd = sync_output_fd,
+        .selection_autoscroll_fd = selection_autoscroll_fd,
+        .taskbar_progress_fd = taskbar_progress_fd,
+        .scrollbar_fd = scrollbar_fd,
+        .kitty_animation_fd = kitty_animation_fd,
+        .compression_fd = compression_fd,
+        .compression_activity = term.compressionActivity(),
+        .scrollbar_alpha = 0,
+        .scrollbar_fading = false,
+        .scrollbar_fade_elapsed_ms = 0,
+        .scrollbar_reveal_hovered = false,
+        .scrollbar_hovered = false,
+        .scrollbar_drag = null,
+        .pointer_x = 0,
+        .pointer_y = 0,
+        .pointer_inside = false,
+        .hovered_link = null,
+        .link_checked_cell = null,
+        .link_active = false,
+        .link_press = null,
+        .drag_press = null,
+        .scroll_pixels = 0,
+        .scroll_frame_pixels = 0,
+        .scroll_clicks = 0,
+        .scroll_value120 = 0,
+        .scroll_line_remainder = 0,
+        .scroll_target = .viewport,
+        .scroll_source = .wheel,
+        .scroll_time_ms = 0,
+        .scroll_had_pixels = false,
+        .scroll_had_discrete = false,
+        .scroll_had_value120 = false,
+        .scroll_stop_time_ms = null,
+        .selecting = false,
+        .selection_rectangle = false,
+        .selection_gesture = .init,
+        .mouse_button = null,
+        .mouse_shape_explicit = false,
+        .active_screen = .primary,
+        .last_serial = 0,
+        .clipboard = .init(alloc, window.data_manager, window.primary_manager),
+        .kitty_clipboard = .init(alloc),
+        .kitty_drag = .init(alloc),
+    };
+    self.stream = .init(.{
+        .allocator = alloc,
+        .handler = .{
+            .app = self,
+            .terminal_handler = .init(&self.term),
+        },
+    });
+    self.stream.handler.terminal_handler.terminfo_name = "unn";
+
+    // Handle sequences that need responses or side effects.
+    var effects: Effects = .readonly;
+    effects.write_pty = effectWritePty;
+    effects.device_attributes = effectDeviceAttributes;
+    effects.enquiry = effectEnquiry;
+    effects.size = effectSize;
+    effects.color_scheme = effectColorScheme;
+    effects.xtversion = effectXtversion;
+    effects.title_changed = effectTitleChanged;
+    effects.bell = effectBell;
+    effects.progress_report = effectProgressReport;
+    effects.clipboard_read = effectClipboardRead;
+    effects.drag_and_drop = effectDragAndDrop;
+    self.stream.handler.terminal_handler.effects = effects;
+    self.clipboard.setDndCallback(self, dndEvent);
+    self.clipboard.setDragCallback(self, dragSourceEvent);
+
+    window.setCallbacks(
+        self,
+        resize,
+        keyboardEvent,
+        pointerEvent,
+        textInputEvent,
+        scaleChanged,
+        redrawReady,
+        activationTokenReady,
+        clipboardDevicesChanged,
+    );
+    return self;
+}
+
+/// Decode a kitty `f=100` payload to RGBA. PNG is standard; SVG is accepted too as an
+/// extension and rasterized at its intrinsic size (see svg.zig).
+fn decodePng(alloc: std.mem.Allocator, data: []const u8) vt.sys.DecodeError!vt.sys.Image {
+    if (svg.looksLikeSvg(data)) {
+        const img = try svg.decode(alloc, data);
+        return .{ .width = img.width, .height = img.height, .data = img.data };
+    }
+    var width: c_int = 0;
+    var height: c_int = 0;
+    var channels: c_int = 0;
+    const decoded = c.stbi_load_from_memory(
+        data.ptr,
+        @intCast(data.len),
+        &width,
+        &height,
+        &channels,
+        4,
+    ) orelse return error.InvalidData;
+    defer c.stbi_image_free(decoded);
+
+    if (width <= 0 or height <= 0) return error.InvalidData;
+    const pixel_count = std.math.mul(usize, @intCast(width), @intCast(height)) catch return error.InvalidData;
+    const len = std.math.mul(usize, pixel_count, 4) catch return error.InvalidData;
+    const out = try alloc.alloc(u8, len);
+    errdefer alloc.free(out);
+
+    @memcpy(out, decoded[0..len]);
+    return .{
+        .width = @intCast(width),
+        .height = @intCast(height),
+        .data = out,
+    };
+}
+
+/// Scale delegate: reload the font at the physical pixel size so glyphs stay crisp.
+/// The resize delegate then re-fits the grid to the new cell metrics.
+fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    const size_px = Config.fontSizePixels(self.effectiveFontSize(), scale120);
+    if (size_px == 0 or size_px == self.font_size_px) return;
+
+    const new_font: Font = try .init(
+        self.alloc,
+        self.config.font_family,
+        size_px,
+        self.config.metric_adjustments,
+    );
+    self.font.deinit(self.alloc);
+    self.font = new_font;
+    self.font_size_px = size_px;
+    self.requestFullAsyncRedraw();
+}
+
+const Handler = TerminalHandler;
+const Effects = Handler.Effects;
+
+/// Effects callbacks only receive the terminal handler; walk back up through unn's wrapper handler.
+fn appFromHandler(handler: *Handler) *App {
+    const app_handler: *AppStreamHandler = @fieldParentPtr("terminal_handler", handler);
+    return app_handler.app;
+}
+
+/// Return type of an Effects callback, e.g. device_attributes.
+fn EffectResult(comptime field_name: []const u8) type {
+    const FnPtr = @typeInfo(@FieldType(Effects, field_name)).optional.child;
+    return @typeInfo(@typeInfo(FnPtr).pointer.child).@"fn".return_type.?;
+}
+
+fn effectWritePty(handler: *Handler, data: []const u8) void {
+    appFromHandler(handler).writePty(data);
+}
+
+fn effectDeviceAttributes(_: *Handler) EffectResult("device_attributes") {
+    return deviceAttributes();
+}
+
+fn deviceAttributes() EffectResult("device_attributes") {
+    return .{
+        .primary = .{
+            .features = &.{ .ansi_color, .clipboard },
+        },
+    };
+}
+
+fn effectEnquiry(_: *Handler) []const u8 {
+    return "";
+}
+
+fn effectProgressReport(handler: *Handler, report: vt.osc.Command.ProgressReport) void {
+    appFromHandler(handler).reportTaskbarProgress(report);
+}
+
+fn effectSize(handler: *Handler) ?vt.size_report.Size {
+    return appFromHandler(handler).currentSize();
+}
+
+fn currentSize(self: *App) vt.size_report.Size {
+    return .{
+        .rows = self.term.rows,
+        .columns = self.term.cols,
+        .cell_width = self.font.cell_width,
+        .cell_height = self.font.cell_height,
+    };
+}
+
+fn effectColorScheme(handler: *Handler) ?vt.device_status.ColorScheme {
+    return appFromHandler(handler).color_scheme;
+}
+
+fn sendColorSchemeReport(self: *App) void {
+    self.writePty(switch (self.color_scheme) {
+        .dark => "\x1B[?997;1n",
+        .light => "\x1B[?997;2n",
+    });
+}
+
+fn effectXtversion(_: *Handler) []const u8 {
+    return "unn " ++ build_options.version;
+}
+
+fn effectTitleChanged(handler: *Handler) void {
+    const self = appFromHandler(handler);
+    const title = self.term.getTitle() orelse return;
+    self.window.toplevel.setTitle(title.ptr);
+}
+
+fn effectBell(handler: *Handler) void {
+    appFromHandler(handler).window.ringBell();
+}
+
+fn effectClipboardRead(_: *Handler, read: vt.clipboard.Read) void {
+    // Presence advertises mode 5522 support in DECRQM. OSC 5522 actions are
+    // intercepted by AppStreamHandler and never use this synchronous path.
+    read.reply(.unsupported);
+}
+
+fn effectDragAndDrop(handler: *Handler, event: vt.kitty.dnd.Event) void {
+    if (event != .acceptance) return;
+    const self = appFromHandler(handler);
+    const state = self.term.kitty_dnd orelse return;
+    const accepted = state.clientAccepted() orelse return;
+    self.clipboard.setDndAcceptance(switch (accepted) {
+        .none => .none,
+        .copy => .copy,
+        .move => .move,
+    });
+}
+
+fn clipboardTarget(location: vt.clipboard.Location) ?Clipboard.Target {
+    return switch (location) {
+        .standard => .clipboard,
+        .selection, .primary => .primary,
+        else => null,
+    };
+}
+
+fn showDesktopNotification(self: *App, title: []const u8, body: []const u8) void {
+    if (self.focused) return;
+
+    const effective_title = if (title.len > 0)
+        title
+    else
+        self.term.getTitle() orelse app_name;
+
+    self.sendDesktopNotification(effective_title, body) catch |err| {
+        log.warn("failed to send desktop notification: {}", .{err});
+    };
+}
+
+fn handleCommandNotification(self: *App, command: vt.osc.Command.SemanticPrompt) void {
+    const completion = self.command_notification.update(
+        command,
+        std.Io.Clock.awake.now(self.io).nanoseconds,
+        &self.config,
+        self.focused,
+    ) orelse return;
+    const actions = self.config.notify_on_command_finish_action;
+    if (actions.bell) self.window.ringBell();
+    if (!actions.notify) return;
+
+    const title = if (completion.exit_code == 0) "Command Succeeded" else "Command Failed";
+    var buf: [160]u8 = undefined;
+    const duration: std.Io.Duration = .fromNanoseconds(@divTrunc(completion.duration.nanoseconds, std.time.ns_per_ms) * std.time.ns_per_ms);
+    const body = std.fmt.bufPrint(&buf, "Command took {f} and exited with code {d}.", .{ duration, completion.exit_code }) catch unreachable;
+    // Completion policy already checked focus; `always` must bypass the
+    // focused-window suppression used for explicit OSC 9/777 notifications.
+    self.sendDesktopNotification(title, body) catch |err| {
+        log.warn("failed to send command completion notification: {}", .{err});
+    };
+}
+
+fn reportTaskbarProgress(self: *App, report: vt.osc.Command.ProgressReport) void {
+    self.sendTaskbarProgress(report) catch |err| {
+        if (err != error.DBusUnavailable) {
+            log.warn("failed to send taskbar progress: {}", .{err});
+        }
+        return;
+    };
+
+    if (report.state == .remove) {
+        self.stopTaskbarProgressTimer();
+    } else {
+        self.armTaskbarProgressTimer();
+    }
+}
+
+/// Finish the session bus setup (filter, matches, poll fd). The connection itself is
+/// made early so its handshake overlaps process setup.
+fn startDbus(self: *App) void {
+    if (!build_options.enable_dbus or self.dbus_started) return;
+    self.dbus_started = true;
+    self.dbus = DbusConnection.connectSession(self.io, self.alloc, self.environ) catch |err| {
+        log.warn("session dbus unavailable; desktop integration disabled: {}", .{err});
+        return;
+    };
+    self.initDbus();
+}
+
+fn initDbus(self: *App) void {
+    if (!build_options.enable_dbus) return;
+    const connection = if (self.dbus != null) &self.dbus.? else return;
+
+    connection.addMatch("type='signal',interface='org.freedesktop.Notifications'") catch {
+        connection.deinit();
+        self.dbus = null;
+        return;
+    };
+    connection.addMatch("type='signal',interface='org.freedesktop.portal.Settings'") catch {
+        connection.deinit();
+        self.dbus = null;
+        return;
+    };
+
+    self.dbus_fd = connection.getFd();
+    self.readPortalAppearance();
+}
+
+fn deinitDbus(self: *App) void {
+    self.sendTaskbarProgress(.{ .state = .remove }) catch {};
+    for (self.pending_dbus.items) |pending| pending.kind.deinit(self.alloc);
+    self.pending_dbus.deinit(self.alloc);
+    var it = self.notifications.valueIterator();
+    while (it.next()) |token| {
+        if (token.*) |value| self.alloc.free(value);
+    }
+    self.notifications.deinit(self.alloc);
+
+    if (!build_options.enable_dbus) return;
+    if (self.dbus) |*connection| {
+        connection.deinit();
+        self.dbus = null;
+        self.dbus_fd = -1;
+    }
+}
+
+fn dispatchDbus(self: *App) void {
+    if (!build_options.enable_dbus) return;
+    const connection = if (self.dbus != null) &self.dbus.? else return;
+    connection.flushWrites() catch |err| {
+        self.disconnectDbus(err);
+        return;
+    };
+    while (connection.nextMessage() catch |err| {
+        self.disconnectDbus(err);
+        return;
+    }) |message_value| {
+        var message = message_value;
+        defer message.deinit();
+        self.handleDbusMessage(&message);
+    }
+}
+
+fn disconnectDbus(self: *App, err: anyerror) void {
+    if (!build_options.enable_dbus) return;
+    log.warn("session dbus disconnected: {}", .{err});
+    if (self.dbus) |*connection| connection.deinit();
+    self.dbus = null;
+    self.dbus_fd = -1;
+    for (self.pending_dbus.items) |pending| pending.kind.deinit(self.alloc);
+    self.pending_dbus.clearRetainingCapacity();
+}
+
+/// Takes ownership of kind only after the complete request is accepted.
+fn sendDbusMethod(
+    self: *App,
+    kind: PendingDbus.Kind,
+    method: DbusConnection.Method,
+    signature: []const u8,
+    body: []const u8,
+    fds: []const posix.fd_t,
+) !void {
+    if (!build_options.enable_dbus) return error.DBusUnavailable;
+    const connection = if (self.dbus != null) &self.dbus.? else return error.DBusUnavailable;
+    if (self.pending_dbus.items.len >= 64) return error.OutgoingQueueFull;
+    try self.pending_dbus.ensureUnusedCapacity(self.alloc, 1);
+    const serial = try connection.sendMethod(method, signature, body, fds);
+    self.pending_dbus.appendAssumeCapacity(.{
+        .serial = serial,
+        .deadline_ns = std.Io.Clock.awake.now(self.io).nanoseconds + std.time.ns_per_s,
+        .kind = kind,
+    });
+}
+
+fn dbusPollTimeoutMs(self: *const App) i32 {
+    const now = std.Io.Clock.awake.now(self.io).nanoseconds;
+    var timeout: i32 = -1;
+    for (self.pending_dbus.items) |pending| {
+        const remaining = @max(0, pending.deadline_ns - now);
+        const ms: i32 = @intCast(@min(std.math.maxInt(i32), @divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+        timeout = if (timeout < 0) ms else @min(timeout, ms);
+    }
+    return timeout;
+}
+
+fn expireDbusRequests(self: *App) void {
+    const now = std.Io.Clock.awake.now(self.io).nanoseconds;
+    var i: usize = 0;
+    while (i < self.pending_dbus.items.len) {
+        if (self.pending_dbus.items[i].deadline_ns > now) {
+            i += 1;
+            continue;
+        }
+        // A timed-out portal may still open the URI. Never launch a second
+        // handler unless an explicit unavailable-service reply was received.
+        const pending = self.pending_dbus.orderedRemove(i);
+        pending.kind.deinit(self.alloc);
+    }
+}
+
+test "OSC 133 completion sends success and failure while always focused" {
+    if (!build_options.enable_dbus) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var sockets: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &sockets,
+    )));
+    var receiver: DbusConnection = .{ .allocator = alloc, .io = std.testing.io, .fd = sockets[1] };
+    defer receiver.deinit();
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.io = std.testing.io;
+    app.focused = true;
+    app.config = .{
+        .notify_on_command_finish = .always,
+        .notify_on_command_finish_action = .{ .bell = false, .notify = true },
+    };
+    app.command_notification = .{};
+    app.pending_dbus = .empty;
+    app.notifications = .empty;
+    app.dbus = .{ .allocator = alloc, .io = std.testing.io, .fd = sockets[0] };
+    defer app.deinitDbus();
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 20, .rows = 4 });
+    defer app.term.deinit(alloc);
+    var stream: AppStream = .init(.{
+        .allocator = alloc,
+        .handler = .{ .app = app, .terminal_handler = .init(&app.term) },
+    });
+    defer stream.deinit();
+
+    // The completion's `always` policy must not change explicit OSC behavior.
+    stream.nextSlice("\x1b]777;notify;Explicit;Suppressed\x07");
+    try std.testing.expectEqual(@as(usize, 0), app.pending_dbus.items.len);
+    for ([_]struct { end: []const u8, title: []const u8, suffix: []const u8 }{
+        .{ .end = "0\x07", .title = "Command Succeeded", .suffix = "exited with code 0." },
+        .{ .end = "17\x1b\\", .title = "Command Failed", .suffix = "exited with code 17." },
+    }) |case| {
+        stream.nextSlice("\x1b]133;C\x07");
+        try std.testing.expect(app.command_notification.started_ns != null);
+        app.command_notification.started_ns = std.Io.Clock.awake.now(app.io).nanoseconds - 7 * std.time.ns_per_s;
+        stream.nextSlice("\x1b]133;D;");
+        stream.nextSlice(case.end);
+        var message = (try receiver.nextMessage()).?;
+        defer message.deinit();
+        try std.testing.expectEqualStrings("Notify", message.header.member.?);
+        try std.testing.expectEqualStrings("susssasa{sv}i", message.bodySignature());
+        var body = message.bodyDecoder();
+        try std.testing.expectEqualStrings("unn", try body.string());
+        try std.testing.expectEqual(@as(u32, 0), try body.uint32());
+        try std.testing.expectEqualStrings("", try body.string());
+        try std.testing.expectEqualStrings(case.title, try body.string());
+        const text = try body.string();
+        try std.testing.expect(std.mem.startsWith(u8, text, "Command took "));
+        try std.testing.expect(std.mem.endsWith(u8, text, case.suffix));
+        stream.nextSlice("\x1b]133;D;0\x07");
+        try std.testing.expectEqual(null, try receiver.nextMessage());
+    }
+    app.config.notify_on_command_finish_action.notify = false;
+    stream.nextSlice("\x1b]133;C\x07");
+    app.command_notification.started_ns = std.Io.Clock.awake.now(app.io).nanoseconds - 7 * std.time.ns_per_s;
+    stream.nextSlice("\x1b]133;D;0\x07");
+    try std.testing.expectEqual(null, try receiver.nextMessage());
+}
+
+test "desktop calls return before replies and correlate delayed notifications" {
+    if (!build_options.enable_dbus) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var sockets: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &sockets,
+    )));
+    defer _ = linux.close(sockets[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.io = std.testing.io;
+    app.config = .{};
+    app.pending_dbus = .empty;
+    app.notifications = .empty;
+    app.dbus = .{ .allocator = alloc, .io = std.testing.io, .fd = sockets[0] };
+    defer app.deinitDbus();
+
+    try app.sendDesktopNotification("test", "delayed reply");
+    try std.testing.expectEqual(@as(usize, 1), app.pending_dbus.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.notifications.count());
+    const serial = app.pending_dbus.items[0].serial;
+    const wire = @import("dbus/wire.zig");
+    var body: DbusConnection.Encoder = .init(alloc);
+    defer body.deinit();
+    try body.uint32(42);
+    const data = try wire.encodeMessage(alloc, .{
+        .message_type = .method_return,
+        .reply_serial = serial,
+        .signature = "u",
+    }, 1, body.bytes(), 0);
+    var reply = try wire.parseMessage(alloc, data, try alloc.alloc(posix.fd_t, 0));
+    defer reply.deinit();
+    app.handleDbusMessage(&reply);
+    try std.testing.expectEqual(@as(usize, 0), app.pending_dbus.items.len);
+    try std.testing.expect(app.notifications.contains(42));
+
+    // No portal reply: expire owned fallback data, never open a second handler.
+    try app.openUriPortal("https://example.com", "activation-token");
+    try std.testing.expectEqual(@as(usize, 1), app.pending_dbus.items.len);
+    app.pending_dbus.items[0].deadline_ns = 0;
+    try std.testing.expectEqual(@as(i32, 0), app.dbusPollTimeoutMs());
+    app.expireDbusRequests();
+    try std.testing.expectEqual(@as(usize, 0), app.pending_dbus.items.len);
+    try std.testing.expectEqual(@as(i32, -1), app.dbusPollTimeoutMs());
+}
+
+fn hasQueuedDbusMessages(self: *const App) bool {
+    if (!build_options.enable_dbus) return false;
+    return if (self.dbus) |*connection| connection.hasQueuedMessages() else false;
+}
+
+fn readPortalAppearance(self: *App) void {
+    self.readPortalAppearanceUint32("color-scheme", .color_scheme);
+    self.readPortalAppearanceUint32("reduced-motion", .reduced_motion);
+}
+
+fn readPortalAppearanceUint32(self: *App, key: []const u8, kind: PendingDbus.Kind) void {
+    var body: DbusConnection.Encoder = .init(self.alloc);
+    defer body.deinit();
+    body.string("org.freedesktop.appearance") catch return;
+    body.string(key) catch return;
+
+    self.sendDbusMethod(kind, .{
+        .destination = "org.freedesktop.portal.Desktop",
+        .path = "/org/freedesktop/portal/desktop",
+        .interface = "org.freedesktop.portal.Settings",
+        .member = "ReadOne",
+    }, "ss", body.bytes(), &.{}) catch {};
+}
+
+fn portalColorScheme(value: u32) vt.device_status.ColorScheme {
+    return switch (value) {
+        2 => .light,
+        else => .dark,
+    };
+}
+
+fn portalReducedMotion(value: u32) bool {
+    return value == 1;
+}
+
+fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !void {
+    if (!build_options.enable_dbus) return error.DBusUnavailable;
+
+    var encoded: DbusConnection.Encoder = .init(self.alloc);
+    defer encoded.deinit();
+    try encoded.string(app_name);
+    try encoded.uint32(0); // replaces_id
+    try encoded.string(""); // app_icon
+    try encoded.string(title);
+    try encoded.string(body);
+
+    const actions = try encoded.beginArray(4);
+    try encoded.string("default");
+    try encoded.string("Open");
+    try encoded.endArray(actions);
+
+    const hints = try encoded.beginArray(8);
+    try dbusAppendStringVariant(&encoded, "desktop-entry", Config.app_id);
+    try encoded.endArray(hints);
+    try encoded.int32(-1); // server default expiration
+
+    try self.sendDbusMethod(.notification, .{
+        .destination = "org.freedesktop.Notifications",
+        .path = "/org/freedesktop/Notifications",
+        .interface = "org.freedesktop.Notifications",
+        .member = "Notify",
+    }, "susssasa{sv}i", encoded.bytes(), &.{});
+}
+
+fn sendTaskbarProgress(self: *App, report: vt.osc.Command.ProgressReport) !void {
+    if (!build_options.enable_dbus) return error.DBusUnavailable;
+    const connection = if (self.dbus != null) &self.dbus.? else return error.DBusUnavailable;
+
+    var encoded: DbusConnection.Encoder = .init(self.alloc);
+    defer encoded.deinit();
+    const desktop_uri = try std.fmt.allocPrint(self.alloc, "application://{s}.desktop", .{Config.app_id});
+    defer self.alloc.free(desktop_uri);
+    try encoded.string(desktop_uri);
+
+    const properties = try encoded.beginArray(8);
+
+    const value = taskbarProgressValue(report);
+    const visible = report.state != .remove;
+    try dbusAppendBoolVariant(&encoded, "progress-visible", visible);
+    try dbusAppendDoubleVariant(&encoded, "progress", value);
+    try encoded.endArray(properties);
+
+    try connection.sendSignal(.{
+        .path = "/com/canonical/Unity/LauncherEntry",
+        .interface = "com.canonical.Unity.LauncherEntry",
+        .member = "Update",
+    }, "sa{sv}", encoded.bytes());
+}
+
+fn taskbarProgressValue(report: vt.osc.Command.ProgressReport) f64 {
+    return switch (report.state) {
+        .remove, .indeterminate => 0.0,
+        .set, .@"error", .pause => if (report.progress) |progress|
+            @as(f64, @floatFromInt(progress)) / 100.0
+        else
+            0.0,
+    };
+}
+
+fn openUriPortal(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !void {
+    if (!build_options.enable_dbus) return error.PortalUnavailable;
+    if (self.dbus == null) return error.PortalUnavailable;
+    const owned_uri = try self.alloc.dupe(u8, uri);
+    errdefer self.alloc.free(owned_uri);
+    const owned_token = if (activation_token) |token| try self.alloc.dupeSentinel(u8, token, 0) else null;
+    errdefer if (owned_token) |token| self.alloc.free(token);
+    const kind: PendingDbus.Kind = .{ .open_uri = .{ .uri = owned_uri, .token = owned_token } };
+
+    // The portal's OpenURI method rejects file:// URIs by design; local
+    // paths go through the fd-passing OpenFile method.
+    var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+    defer arena_state.deinit();
+    if (try clipboard_format.osc7Path(arena_state.allocator(), uri)) |path| {
+        return self.openFilePortal(path, activation_token, kind);
+    }
+
+    var encoded: DbusConnection.Encoder = .init(self.alloc);
+    defer encoded.deinit();
+    try encoded.string(""); // parent window
+    try encoded.string(uri);
+    const options = try encoded.beginArray(8);
+    if (activation_token) |token| try dbusAppendStringVariant(&encoded, "activation_token", token);
+    try encoded.endArray(options);
+
+    try self.sendPortalCall(kind, "OpenURI", "ssa{sv}", encoded.bytes(), &.{});
+}
+
+/// Open a local file or directory through the portal by passing an fd:
+/// files open with the default handler, directories in the file manager.
+fn openFilePortal(
+    self: *App,
+    path: [:0]const u8,
+    activation_token: ?[:0]const u8,
+    kind: PendingDbus.Kind,
+) !void {
+    const linux = std.os.linux;
+
+    // OpenFile handles files and directories; OpenDirectory reveals the target in its
+    // parent. NONBLOCK keeps FIFOs from blocking the loop.
+    const rc = linux.openat(linux.AT.FDCWD, path, .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NONBLOCK = true,
+    }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+    const fd: posix.fd_t = @intCast(rc);
+    // The connection duplicates the descriptor before returning.
+    defer _ = linux.close(fd);
+
+    var encoded: DbusConnection.Encoder = .init(self.alloc);
+    defer encoded.deinit();
+    try encoded.string(""); // parent window
+    try encoded.unixFd(0);
+    const options = try encoded.beginArray(8);
+    if (activation_token) |token| try dbusAppendStringVariant(&encoded, "activation_token", token);
+    try encoded.endArray(options);
+
+    try self.sendPortalCall(
+        kind,
+        "OpenFile",
+        "sha{sv}",
+        encoded.bytes(),
+        &.{fd},
+    );
+}
+
+test "local file and directory links open the target rather than reveal its parent" {
+    if (!build_options.enable_dbus) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const linux = std.os.linux;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "file", .data = "content" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    var sockets: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &sockets,
+    )));
+    app.alloc = alloc;
+    app.io = io;
+    app.dbus = .{ .allocator = alloc, .io = io, .fd = sockets[0], .unix_fd_enabled = true };
+    defer app.dbus.?.deinit();
+    app.pending_dbus = .empty;
+    defer {
+        for (app.pending_dbus.items) |pending| pending.kind.deinit(alloc);
+        app.pending_dbus.deinit(alloc);
+    }
+    var peer: DbusConnection = .{ .allocator = alloc, .io = io, .fd = sockets[1] };
+    defer peer.deinit();
+
+    for ([_][]const u8{ "/file", "" }) |suffix| {
+        const path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ path_buf[0..path_len], suffix });
+        defer alloc.free(path);
+        const uri = try std.fmt.allocPrint(alloc, "file://{s}", .{path});
+        defer alloc.free(uri);
+        try app.openUriPortal(uri, "activation-token");
+
+        var message = (try peer.nextMessage()) orelse return error.TestExpectedMessage;
+        defer message.deinit();
+        try std.testing.expectEqualStrings("OpenFile", message.header.member.?);
+        try std.testing.expectEqualStrings("sha{sv}", message.bodySignature());
+        try std.testing.expectEqual(@as(usize, 1), message.fds.len);
+        var fd_path_buf: [64]u8 = undefined;
+        const fd_path = try std.mem.printSentinel(&fd_path_buf, "/proc/self/fd/{d}", .{message.fds[0]}, 0);
+        var target: [std.fs.max_path_bytes]u8 = undefined;
+        const n = linux.readlinkat(linux.AT.FDCWD, fd_path, &target, target.len);
+        try std.testing.expectEqual(.SUCCESS, linux.errno(n));
+        try std.testing.expectEqualStrings(path, target[0..n]);
+
+        var decoder = message.bodyDecoder();
+        try std.testing.expectEqualStrings("", try decoder.string());
+        try std.testing.expectEqual(@as(u32, 0), try decoder.uint32());
+        const options_end = try decoder.beginArray(8);
+        try decoder.structAlignment();
+        try std.testing.expectEqualStrings("activation_token", try decoder.string());
+        try std.testing.expectEqualStrings("s", try decoder.variantSignature());
+        try std.testing.expectEqualStrings("activation-token", try decoder.string());
+        try decoder.endArray(options_end);
+        try decoder.end();
+    }
+}
+
+/// Takes ownership of kind on success; the eventual reply decides fallback.
+fn sendPortalCall(
+    self: *App,
+    kind: PendingDbus.Kind,
+    member: []const u8,
+    signature: []const u8,
+    body: []const u8,
+    fds: []const posix.fd_t,
+) !void {
+    try self.sendDbusMethod(kind, .{
+        .destination = "org.freedesktop.portal.Desktop",
+        .path = "/org/freedesktop/portal/desktop",
+        .interface = "org.freedesktop.portal.OpenURI",
+        .member = member,
+    }, signature, body, fds);
+}
+
+fn isPortalUnavailableErrorName(name: []const u8) bool {
+    const unavailable = [_][]const u8{
+        "org.freedesktop.DBus.Error.ServiceUnknown",
+        "org.freedesktop.DBus.Error.NameHasNoOwner",
+        "org.freedesktop.DBus.Error.UnknownMethod",
+        "org.freedesktop.DBus.Error.UnknownInterface",
+        "org.freedesktop.DBus.Error.UnknownObject",
+    };
+    for (unavailable) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+test "only definitive portal errors enable fallback" {
+    try std.testing.expect(isPortalUnavailableErrorName(
+        "org.freedesktop.DBus.Error.ServiceUnknown",
+    ));
+    try std.testing.expect(isPortalUnavailableErrorName(
+        "org.freedesktop.DBus.Error.UnknownMethod",
+    ));
+    try std.testing.expect(!isPortalUnavailableErrorName(
+        "org.freedesktop.DBus.Error.NoReply",
+    ));
+    try std.testing.expect(!isPortalUnavailableErrorName(
+        "org.freedesktop.DBus.Error.TimedOut",
+    ));
+}
+
+fn dbusAppendStringVariant(
+    encoder: *DbusConnection.Encoder,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    try encoder.dictEntryAlignment();
+    try encoder.string(key);
+    try encoder.variantSignature("s");
+    try encoder.string(value);
+}
+
+fn dbusAppendBoolVariant(
+    encoder: *DbusConnection.Encoder,
+    key: []const u8,
+    value: bool,
+) !void {
+    try encoder.dictEntryAlignment();
+    try encoder.string(key);
+    try encoder.variantSignature("b");
+    try encoder.boolean(value);
+}
+
+fn dbusAppendDoubleVariant(
+    encoder: *DbusConnection.Encoder,
+    key: []const u8,
+    value: f64,
+) !void {
+    try encoder.dictEntryAlignment();
+    try encoder.string(key);
+    try encoder.variantSignature("d");
+    try encoder.double(value);
+}
+
+fn handleDbusMessage(self: *App, message: *const DbusConnection.Message) void {
+    if (message.messageType() == .method_return or message.messageType() == .error_reply) {
+        const serial = message.header.reply_serial orelse return;
+        for (self.pending_dbus.items, 0..) |pending, i| {
+            if (pending.serial != serial) continue;
+            _ = self.pending_dbus.orderedRemove(i);
+            defer pending.kind.deinit(self.alloc);
+            self.handleDbusReply(pending.kind, message);
+            return;
+        }
+        return;
+    }
+    if (message.messageType() != .signal) return;
+    const interface = message.header.interface orelse return;
+    const member = message.header.member orelse return;
+    if (std.mem.eql(u8, interface, "org.freedesktop.Notifications")) {
+        if (std.mem.eql(u8, member, "ActivationToken")) {
+            self.handleNotificationActivationToken(message);
+        } else if (std.mem.eql(u8, member, "ActionInvoked")) {
+            self.handleNotificationActionInvoked(message);
+        } else if (std.mem.eql(u8, member, "NotificationClosed")) {
+            self.handleNotificationClosed(message);
+        }
+    } else if (std.mem.eql(u8, interface, "org.freedesktop.portal.Settings") and
+        std.mem.eql(u8, member, "SettingChanged"))
+    {
+        self.handlePortalSettingChanged(message);
+    }
+}
+
+fn handleDbusReply(self: *App, kind: PendingDbus.Kind, message: *const DbusConnection.Message) void {
+    if (kind == .open_uri) {
+        if (message.messageType() == .error_reply) {
+            if (message.header.error_name) |name| if (isPortalUnavailableErrorName(name)) {
+                self.openUriXdg(kind.open_uri.uri, kind.open_uri.token) catch |err| {
+                    log.warn("failed to open hyperlink with xdg-open: {}", .{err});
+                };
+            };
+        }
+        return;
+    }
+    if (message.messageType() != .method_return) return;
+    var decoder = message.bodyDecoder();
+    switch (kind) {
+        .notification => {
+            if (!std.mem.eql(u8, message.bodySignature(), "u")) return;
+            const id = decoder.uint32() catch return;
+            decoder.end() catch return;
+            const old = self.notifications.fetchPut(self.alloc, id, null) catch return;
+            if (old) |entry| if (entry.value) |token| self.alloc.free(token);
+        },
+        .color_scheme, .reduced_motion => {
+            if (!std.mem.eql(u8, message.bodySignature(), "v")) return;
+            const signature = decoder.variantSignature() catch return;
+            if (!std.mem.eql(u8, signature, "u")) return;
+            const value = decoder.uint32() catch return;
+            decoder.end() catch return;
+            if (kind == .color_scheme)
+                self.setColorScheme(portalColorScheme(value), true)
+            else
+                self.setReducedMotion(portalReducedMotion(value));
+        },
+        .open_uri => unreachable,
+    }
+}
+
+fn handlePortalSettingChanged(self: *App, message: *const DbusConnection.Message) void {
+    if (!std.mem.eql(u8, message.bodySignature(), "ssv")) return;
+    var decoder = message.bodyDecoder();
+    const namespace = decoder.string() catch return;
+    if (!std.mem.eql(u8, namespace, "org.freedesktop.appearance")) return;
+
+    const key = decoder.string() catch return;
+    const color_scheme_changed = std.mem.eql(u8, key, "color-scheme");
+    const reduced_motion_changed = std.mem.eql(u8, key, "reduced-motion");
+    if (!color_scheme_changed and !reduced_motion_changed) return;
+
+    const variant_signature = decoder.variantSignature() catch return;
+    if (!std.mem.eql(u8, variant_signature, "u")) return;
+    const value = decoder.uint32() catch return;
+    decoder.end() catch return;
+    if (color_scheme_changed) {
+        const color_scheme = portalColorScheme(value);
+        if (self.color_scheme != color_scheme) self.setColorScheme(color_scheme, true);
+    } else {
+        self.setReducedMotion(portalReducedMotion(value));
+    }
+}
+
+fn setColorScheme(self: *App, color_scheme: vt.device_status.ColorScheme, report: bool) void {
+    self.color_scheme = color_scheme;
+    if (report and self.term.modes.get(.report_color_scheme)) self.sendColorSchemeReport();
+}
+
+fn setReducedMotion(self: *App, reduced_motion: bool) void {
+    if (self.reduced_motion == reduced_motion) return;
+    self.reduced_motion = reduced_motion;
+    if (reduced_motion and self.scrollbar_fading) {
+        self.hideScrollbar();
+        self.syncHoveredLink(true);
+    }
+}
+
+fn handleNotificationActivationToken(self: *App, message: *const DbusConnection.Message) void {
+    if (!std.mem.eql(u8, message.bodySignature(), "us")) return;
+    var decoder = message.bodyDecoder();
+    const notification_id = decoder.uint32() catch return;
+    const token_slot = self.notifications.getPtr(notification_id) orelse return;
+    const token = decoder.string() catch return;
+    decoder.end() catch return;
+
+    const owned = self.alloc.dupe(u8, token) catch return;
+    if (token_slot.*) |old| self.alloc.free(old);
+    token_slot.* = owned;
+}
+
+fn handleNotificationClosed(self: *App, message: *const DbusConnection.Message) void {
+    if (!std.mem.eql(u8, message.bodySignature(), "uu")) return;
+    var decoder = message.bodyDecoder();
+    const notification_id = decoder.uint32() catch return;
+    _ = decoder.uint32() catch return; // Every close reason invalidates the ID.
+    decoder.end() catch return;
+
+    const notification = self.notifications.fetchRemove(notification_id) orelse return;
+    if (notification.value) |token| self.alloc.free(token);
+}
+
+fn handleNotificationActionInvoked(self: *App, message: *const DbusConnection.Message) void {
+    if (!std.mem.eql(u8, message.bodySignature(), "us")) return;
+    var decoder = message.bodyDecoder();
+    const notification_id = decoder.uint32() catch return;
+    const notification = self.notifications.fetchRemove(notification_id) orelse return;
+    defer if (notification.value) |token| self.alloc.free(token);
+    const action = decoder.string() catch return;
+    decoder.end() catch return;
+    if (!std.mem.eql(u8, action, "default")) return;
+
+    if (notification.value) |token| {
+        if (token.len > 0) {
+            const token_z = self.alloc.dupeSentinel(u8, token, 0) catch return;
+            defer self.alloc.free(token_z);
+            self.window.activate(token_z);
+            return;
+        }
+    }
+
+    const requested = self.window.requestAttention() catch |err| {
+        log.warn("failed to request attention after notification activation: {}", .{err});
+        return;
+    };
+    if (!requested) log.warn("cannot request attention: xdg-activation is unavailable", .{});
+}
+
+test "closed notifications retire only the matching ID and release its token" {
+    const alloc = std.testing.allocator;
+    const wire = @import("dbus/wire.zig");
+    const cases = [_]struct {
+        id: u32 = 42,
+        reason: u32 = 1,
+        signature: []const u8 = "uu",
+        token: bool = false,
+        closed: bool = true,
+    }{
+        .{}, // Expired without an activation token.
+        .{ .reason = 2, .token = true }, // Dismissed after receiving a token.
+        .{ .reason = 3 }, // Explicitly closed.
+        .{ .reason = 4, .token = true }, // Reserved reason still invalidates the ID.
+        .{ .id = 123, .token = true, .closed = false },
+        .{ .signature = "u", .token = true, .closed = false },
+    };
+    for (cases) |case| {
+        const app = try alloc.create(App);
+        defer alloc.destroy(app);
+        app.alloc = alloc;
+        app.dbus = no_dbus;
+        app.pending_dbus = .empty;
+        app.notifications = .empty;
+        defer app.deinitDbus();
+        try app.notifications.put(alloc, 7, null);
+        try app.notifications.put(alloc, 42, null);
+        if (case.token) app.notifications.getPtr(42).?.* = try alloc.dupe(u8, "activation-token");
+
+        var body: DbusConnection.Encoder = .init(alloc);
+        defer body.deinit();
+        try body.uint32(case.id);
+        if (std.mem.eql(u8, case.signature, "uu")) try body.uint32(case.reason);
+        const data = try wire.encodeMessage(alloc, .{
+            .message_type = .signal,
+            .path = "/org/freedesktop/Notifications",
+            .interface = "org.freedesktop.Notifications",
+            .member = "NotificationClosed",
+            .signature = case.signature,
+        }, 1, body.bytes(), 0);
+        var message = try wire.parseMessage(alloc, data, try alloc.alloc(posix.fd_t, 0));
+        defer message.deinit();
+
+        // A repeated close must neither free a token twice nor remove another ID.
+        for (0..2) |_| {
+            app.handleDbusMessage(&message);
+            try std.testing.expectEqual(!case.closed, app.notifications.contains(42));
+            try std.testing.expect(app.notifications.contains(7));
+            try std.testing.expectEqual(@as(u32, if (case.closed) 1 else 2), app.notifications.count());
+            if (!case.closed and case.token)
+                try std.testing.expectEqualStrings("activation-token", app.notifications.get(42).?.?);
+        }
+    }
+}
+
+fn setNonblocking(fd: posix.fd_t) void {
+    const linux = std.os.linux;
+    const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS) return;
+    _ = linux.fcntl(fd, linux.F.SETFL, flags | nonblock);
+}
+
+pub fn deinit(self: *App) void {
+    self.hangupChild();
+    self.pipeline.deinit();
+    self.pty.deinit();
+    self.cancelDrag();
+    self.selection_gesture.deinit(&self.term);
+    if (self.async_raster_loader) |*loader| loader.deinit();
+    if (self.async_raster) |*async_raster| async_raster.deinit();
+    self.frame_damage.deinit();
+    self.async_job.deinit(self.alloc, &self.kitty_cache);
+    if (self.hovered_link) |link| self.alloc.free(link.uri);
+    if (self.link_press) |press| self.alloc.free(press.uri);
+    self.kitty_cache.deinit(self.alloc);
+    self.clearImeText();
+    self.kitty_clipboard.deinit();
+    self.kitty_drag.deinit();
+    self.clipboard.deinit();
+    self.write_queue.deinit(self.alloc);
+    if (self.pending_open_uri) |uri| self.alloc.free(uri);
+    self.deinitDbus();
+    _ = std.os.linux.close(self.compression_fd);
+    _ = std.os.linux.close(self.kitty_animation_fd);
+    _ = std.os.linux.close(self.scrollbar_fd);
+    _ = std.os.linux.close(self.taskbar_progress_fd);
+    _ = std.os.linux.close(self.selection_autoscroll_fd);
+    _ = std.os.linux.close(self.sync_output_fd);
+    _ = std.os.linux.close(self.fling_fd);
+    _ = std.os.linux.close(self.repeat_fd);
+    _ = std.os.linux.close(self.signal_fd);
+    self.keyboard.deinit();
+    self.window.destroy();
+    self.scroll_detector.deinit(self.alloc);
+    self.render_state.deinit(self.alloc);
+    self.stream.deinit();
+    self.term.deinit(self.alloc);
+    self.font.deinit(self.alloc);
+    self.config_arena.deinit();
+    self.alloc.destroy(self);
+}
+
+/// Run until the window closes or the child exits.
+pub fn run(self: *App) !void {
+    errdefer self.hangupChild();
+
+    // The raster worker is the only renderer; start building it before
+    // the first configure so it is usually ready by the first frame.
+    self.startAsyncRasterLoad();
+
+    try self.pipeline.start();
+
+    const display = self.window.display;
+    var fds = [_]posix.pollfd{
+        .{ .fd = display.getFd(), .events = posix.POLL.IN, .revents = 0 },
+        // Parsed pty batches arrive via the pipeline's ready eventfd;
+        // the master itself is only polled for writability (below).
+        .{ .fd = self.pipeline.ready_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 },
+        .{ .fd = self.repeat_fd, .events = posix.POLL.IN, .revents = 0 },
+        // In-flight paste pipe; negative (ignored) while idle.
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.signal_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.sync_output_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.selection_autoscroll_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.taskbar_progress_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.dbus_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.fling_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.scrollbar_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.kitty_animation_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.compression_fd, .events = posix.POLL.IN, .revents = 0 },
+    } ++ @as([Clipboard.max_outgoing_transfers]posix.pollfd, @splat(.{
+        .fd = -1,
+        .events = posix.POLL.OUT,
+        .revents = 0,
+    }));
+    const wl_fd = &fds[0];
+    const pipeline_fd = &fds[1];
+    const pty_write_fd = &fds[2];
+    const repeat_fd = &fds[3];
+    const paste_fd = &fds[4];
+    const signal_fd = &fds[5];
+    const sync_output_fd = &fds[6];
+    const selection_autoscroll_fd = &fds[7];
+    const taskbar_progress_fd = &fds[8];
+    const dbus_fd = &fds[9];
+    const async_fd = &fds[10];
+    const fling_fd = &fds[11];
+    const scrollbar_fd = &fds[12];
+    const kitty_animation_fd = &fds[13];
+    const compression_fd = &fds[14];
+    const outgoing_clipboard_fds = fds[15..][0..Clipboard.max_outgoing_transfers];
+
+    while (self.window.running and !self.child_exited) {
+        self.expireDbusRequests();
+        self.expireClipboardTransfers();
+        self.syncScrollbackCompression();
+        wl_fd.events = posix.POLL.IN;
+        dbus_fd.fd = self.dbus_fd;
+        async_fd.fd = if (self.async_raster_loader) |*loader|
+            loader.complete_fd
+        else if (self.async_raster) |*async_raster|
+            async_raster.complete_fd
+        else
+            -1;
+
+        // Standard libwayland read dance: drain the local queue, flush
+        // requests, then sleep until one of the fds is ready.
+        while (!display.prepareRead()) {
+            if (display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
+            self.window.flushPending();
+            self.syncTerminalVisibility();
+        }
+        if (self.hasQueuedDbusMessages()) {
+            display.cancelRead();
+            self.dispatchDbus();
+            continue;
+        }
+        // Wayland callbacks may request a redraw while prepareRead drains the queue; redraw
+        // before an infinite poll or it can stay stranded until another fd wakes us.
+        if (self.hasReadyRedraw()) {
+            display.cancelRead();
+            try self.redrawIfNeeded();
+            continue;
+        }
+        switch (display.flush()) {
+            .SUCCESS => {},
+            // Socket full: wait for writability in the main poll set so
+            // PTY output still drains while the compositor catches up.
+            .AGAIN => wl_fd.events |= posix.POLL.OUT,
+            else => {
+                display.cancelRead();
+                return error.FlushFailed;
+            },
+        }
+
+        // Only poll the master while a write backlog exists, otherwise
+        // POLLOUT would make every poll return immediately.
+        pty_write_fd.fd = if (self.write_queue.items.len > 0) self.pty.master else -1;
+        paste_fd.fd = self.clipboard.transferFd();
+        self.clipboard.pollOutgoing(outgoing_clipboard_fds);
+        dbus_fd.events = posix.POLL.IN;
+        if (build_options.enable_dbus) {
+            if (self.dbus) |*connection| {
+                if (connection.hasPendingWrites()) dbus_fd.events |= posix.POLL.OUT;
+            }
+        }
+        const clipboard_timeout = self.clipboard.pollTimeoutMs();
+        const dbus_timeout = self.dbusPollTimeoutMs();
+        const timeout = if (clipboard_timeout < 0) dbus_timeout else if (dbus_timeout < 0) clipboard_timeout else @min(clipboard_timeout, dbus_timeout);
+        const ready = posix.poll(&fds, timeout) catch {
+            display.cancelRead();
+            return error.PollFailed;
+        };
+        _ = ready;
+
+        if (wl_fd.revents & posix.POLL.IN != 0) {
+            if (display.readEvents() != .SUCCESS) return error.ReadEventsFailed;
+        } else {
+            display.cancelRead();
+        }
+        if (display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
+        self.window.flushPending();
+        self.syncTerminalVisibility();
+
+        if (signal_fd.revents & posix.POLL.IN != 0) {
+            try self.drainSignals();
+        }
+
+        if (pty_write_fd.revents & posix.POLL.OUT != 0) {
+            self.flushWriteQueue();
+        }
+        if (pipeline_fd.revents & posix.POLL.IN != 0) {
+            try self.drainPipeline();
+        }
+
+        if (repeat_fd.revents & posix.POLL.IN != 0) {
+            self.fireRepeat();
+        }
+
+        if (sync_output_fd.revents & posix.POLL.IN != 0) {
+            self.fireSyncOutputReset();
+        }
+
+        if (selection_autoscroll_fd.revents & posix.POLL.IN != 0) {
+            self.fireSelectionAutoscroll();
+        }
+
+        if (fling_fd.revents & posix.POLL.IN != 0) {
+            self.fireFling();
+        }
+
+        if (scrollbar_fd.revents & posix.POLL.IN != 0) {
+            self.fireScrollbarFade();
+        }
+
+        if (kitty_animation_fd.revents & posix.POLL.IN != 0) {
+            self.fireKittyAnimation();
+        }
+
+        if (compression_fd.revents & posix.POLL.IN != 0) {
+            self.fireScrollbackCompression();
+        }
+
+        if (taskbar_progress_fd.revents & posix.POLL.IN != 0) {
+            self.fireTaskbarProgressTimeout();
+        }
+
+        if (dbus_fd.revents & (posix.POLL.IN | posix.POLL.OUT | posix.POLL.HUP | posix.POLL.ERR) != 0 or
+            self.hasQueuedDbusMessages())
+        {
+            self.dispatchDbus();
+        }
+
+        if (async_fd.revents & posix.POLL.IN != 0) {
+            if (self.async_raster_loader != null)
+                self.finishAsyncRasterLoad()
+            else
+                self.finishAsyncRender();
+        }
+
+        self.clipboard.dispatchOutgoing(outgoing_clipboard_fds);
+        if (self.clipboard.transferFd() >= 0 and paste_fd.fd == self.clipboard.transferFd() and
+            paste_fd.revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0)
+        {
+            self.readClipboardTransfer();
+        }
+
+        try self.redrawIfNeeded();
+    }
+
+    if (self.window.fatal_error != null) {
+        self.hangupChild();
+        return error.WindowFatal;
+    }
+
+    // Window closed with the child alive: hang up like a terminal whose master went away.
+    // Don't wait here; shells can wait on jobs holding the slave open and wedge us.
+    if (!self.child_exited) {
+        self.hangupChild();
+    }
+}
+
+fn hangupChild(self: *App) void {
+    // The gather thread must be joined before the master can be closed;
+    // stop() is idempotent and deinit covers the child-exited path.
+    self.pipeline.stop();
+    if (self.child_exited) {
+        return;
+    }
+    self.pty.closeMaster();
+    _ = std.os.linux.kill(self.child_pid, std.os.linux.SIG.HUP);
+}
+
+/// Signal events arrived. SIGCHLD is the only place the terminal decides
+/// the session is over; SIGUSR1 reloads process-local configuration.
+fn drainSignals(self: *App) !void {
+    var info: std.os.linux.signalfd_siginfo = undefined;
+    var saw_sigchld = false;
+    var saw_sigusr1 = false;
+    while (true) {
+        const n = posix.read(self.signal_fd, std.mem.asBytes(&info)) catch break;
+        if (n == 0) break;
+        switch (info.signo) {
+            @backingInt(std.os.linux.SIG.CHLD) => saw_sigchld = true,
+            @backingInt(std.os.linux.SIG.USR1) => saw_sigusr1 = true,
+            else => {},
+        }
+    }
+    if (saw_sigusr1) self.reloadConfig();
+    if (saw_sigchld) {
+        if (try Pty.tryWait(self.child_pid)) |status| {
+            log.debug("child exited with status {d}", .{status});
+            self.child_exited = true;
+            try self.finishChildOutput();
+        }
+    }
+}
+
+/// After wait4 confirms the child is gone: join the gatherer, consume what it published,
+/// then drain unread bytes from the master before ending the session.
+fn finishChildOutput(self: *App) !void {
+    self.pipeline.stop();
+    try self.drainPipeline();
+    const consumed = try drainPtyTail(self.pty.master, &self.stream);
+    if (consumed) {
+        self.needs_redraw = true;
+        self.syncPtyOutput(true);
+    }
+}
+
+fn reloadConfig(self: *App) void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+    var committed = false;
+    defer if (!committed) arena_state.deinit();
+
+    const arena = arena_state.allocator();
+    var new_config = if (self.config_path) |path|
+        Config.loadPath(arena, path)
+    else
+        Config.load(arena, self.environ);
+    for (self.config_overrides) |override| {
+        new_config.applyOverride(arena, override) catch |err| {
+            log.warn("config override failed: {s}: {}", .{ override, err });
+            return;
+        };
+    }
+    self.applyConfig(new_config) catch |err| {
+        log.warn("config reload failed: {}", .{err});
+        return;
+    };
+
+    self.config_arena.deinit();
+    self.config_arena = arena_state;
+    self.config = new_config;
+    committed = true;
+    log.info("config reloaded", .{});
+}
+
+fn spawnDetached(
+    path: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    pwd: ?[:0]const u8,
+    label: []const u8,
+) bool {
+    const linux = std.os.linux;
+
+    // Double fork: the intermediate child exits immediately so init adopts
+    // the launched process and it never lingers as our zombie.
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) {
+        log.err("{s} fork failed: {}", .{ label, linux.errno(fork_rc) });
+        return false;
+    }
+    const pid: posix.pid_t = @intCast(fork_rc);
+
+    if (pid == 0) {
+        // Intermediate child: async-signal-safe calls only. Reset the signal mask (blocked for
+        // our signalfd) and start a new session.
+        const empty_mask = posix.sigemptyset();
+        posix.sigprocmask(linux.SIG.SETMASK, &empty_mask, null);
+        _ = linux.setsid();
+        const detached_rc = linux.fork();
+        if (linux.errno(detached_rc) != .SUCCESS) linux.exit(127);
+        if (detached_rc != 0) linux.exit(0);
+
+        if (pwd) |p| _ = linux.chdir(p.ptr);
+        _ = linux.execve(path, argv, envp);
+        linux.exit(127); // exec failed
+    }
+
+    // Reap the intermediate child; it exits right after the second fork.
+    var status: i32 = undefined;
+    _ = linux.wait4(pid, &status, 0, null);
+    return waitStatusExitedZero(status);
+}
+
+fn waitStatusExitedZero(status: i32) bool {
+    return (status & 0x7f) == 0 and (status >> 8) == 0;
+}
+
+pub fn resolveCommandPath(
+    arena: std.mem.Allocator,
+    environ: std.process.Environ,
+    command: [:0]const u8,
+    cwd: ?[:0]const u8,
+) ![*:0]const u8 {
+    return (try resolveCommandPathZ(arena, environ, command, cwd)).ptr;
+}
+
+/// Search PATH relative to the child's cwd (null inherits ours); relative results must be
+/// executed from there. Explicit paths skip lookup; a miss returns CommandNotFound.
+pub fn resolveCommandPathZ(
+    arena: std.mem.Allocator,
+    environ: std.process.Environ,
+    command: [:0]const u8,
+    cwd: ?[:0]const u8,
+) ![:0]const u8 {
+    if (std.mem.indexOfScalar(u8, command, '/') != null) return command;
+
+    const path_env = environ.getPosix("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
+    var dirs = std.mem.splitScalar(u8, path_env, ':');
+    while (dirs.next()) |dir| {
+        const base = if (dir.len == 0) "." else dir;
+        const candidate = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ base, command }, 0);
+        const probe = if (cwd != null and !std.fs.path.isAbsolute(candidate))
+            try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ cwd.?, candidate }, 0)
+        else
+            candidate;
+        var stat = std.mem.zeroes(std.os.linux.Statx);
+        const stat_rc = std.os.linux.statx(
+            std.os.linux.AT.FDCWD,
+            probe,
+            std.os.linux.AT.NO_AUTOMOUNT,
+            .{ .TYPE = true },
+            &stat,
+        );
+        if (std.os.linux.errno(stat_rc) == .SUCCESS and stat.mask.TYPE and
+            std.os.linux.S.ISREG(stat.mode) and
+            std.os.linux.errno(std.os.linux.access(probe, std.os.linux.X_OK)) == .SUCCESS)
+        {
+            return candidate;
+        }
+    }
+    return error.CommandNotFound;
+}
+
+/// Ctrl+Shift+Z/X: move the scrollback viewport between OSC 133 prompt marks.
+fn jumpPrompt(self: *App, delta: isize) void {
+    const screen = self.term.screens.active;
+    if (!screen.semantic_prompt.seen) return;
+    self.stopFling();
+    self.resetSmoothScroll();
+    screen.pages.scroll(.{ .delta_prompt = delta });
+    self.revealScrollbar();
+    self.clearSelection();
+    self.needs_redraw = true;
+    self.syncHoveredLink(true);
+}
+
+/// Ctrl+Shift+G: pipe the most recent OSC 133-delimited command output to
+/// the configured shell command. The command runs as `/bin/sh -c <value>`.
+fn pipeCommandOutput(self: *App) void {
+    const command = self.config.pipe_command_output orelse return;
+    const output = self.lastCommandOutput() orelse return;
+    defer self.alloc.free(output);
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pwd: ?[:0]const u8 = pwd: {
+        const url = self.term.getPwd() orelse break :pwd null;
+        break :pwd clipboard_format.osc7Path(arena, url) catch null;
+    };
+    const envp = self.spawnEnvp(arena, pwd, null) catch |err| {
+        log.err("pipe command env setup failed: {}", .{err});
+        return;
+    };
+
+    spawnPipeCommand(command, output, envp, pwd);
+}
+
+fn lastCommandOutput(self: *App) ?[:0]const u8 {
+    return semanticCommandOutputText(self.alloc, self.term.screens.active);
+}
+
+fn semanticCommandOutputText(alloc: std.mem.Allocator, screen: *vt.Screen) ?[:0]const u8 {
+    if (!screen.semantic_prompt.seen) return null;
+
+    var it = screen.pages.promptIterator(.left_up, .{ .screen = .{} }, null);
+    while (it.next()) |prompt_pin| {
+        const hl = screen.pages.highlightSemanticContent(prompt_pin, .output) orelse continue;
+        const sel = vt.Selection.init(hl.start, hl.end, false);
+        return screen.selectionString(alloc, .{ .sel = sel, .trim = false }) catch null;
+    }
+    return null;
+}
+
+fn spawnPipeCommand(
+    command: [:0]const u8,
+    output: []const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    pwd: ?[:0]const u8,
+) void {
+    const linux = std.os.linux;
+
+    var fds: [2]posix.fd_t = undefined;
+    const pipe_rc = linux.pipe2(&fds, .{ .CLOEXEC = true });
+    if (linux.errno(pipe_rc) != .SUCCESS) {
+        log.err("pipe command pipe failed: {}", .{linux.errno(pipe_rc)});
+        return;
+    }
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) {
+        log.err("pipe command fork failed: {}", .{linux.errno(fork_rc)});
+        return;
+    }
+    const pid: posix.pid_t = @intCast(fork_rc);
+
+    if (pid == 0) {
+        const empty_mask = posix.sigemptyset();
+        posix.sigprocmask(linux.SIG.SETMASK, &empty_mask, null);
+        _ = linux.setsid();
+
+        const runner_rc = linux.fork();
+        if (linux.errno(runner_rc) == .SUCCESS and runner_rc == 0) {
+            runPipeCommandChild(command, envp, pwd, fds[0], fds[1]);
+        }
+
+        const writer_rc = linux.fork();
+        if (linux.errno(writer_rc) == .SUCCESS and writer_rc == 0) {
+            writePipeCommandChild(output, fds[1]);
+        }
+
+        _ = linux.close(fds[0]);
+        _ = linux.close(fds[1]);
+        linux.exit(0);
+    }
+
+    var status: i32 = undefined;
+    _ = linux.wait4(pid, &status, 0, null);
+}
+
+fn runPipeCommandChild(
+    command: [:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    pwd: ?[:0]const u8,
+    read_fd: posix.fd_t,
+    write_fd: posix.fd_t,
+) noreturn {
+    const linux = std.os.linux;
+    std.debug.assert(read_fd >= 0 and write_fd >= 0 and read_fd != write_fd);
+    if (pwd) |p| _ = linux.chdir(p.ptr);
+    // The pipe may occupy standard descriptors when inherited stdio is
+    // closed. Close its writer before installing stdin, never afterwards.
+    _ = linux.close(write_fd);
+    if (linux.errno(linux.dup2(read_fd, 0)) != .SUCCESS) linux.exit(126);
+    if (read_fd != 0) {
+        _ = linux.close(read_fd);
+    } else {
+        // dup2(fd, fd) retains CLOEXEC, including for /dev/null below.
+        if (linux.errno(linux.fcntl(0, linux.F.SETFD, 0)) != .SUCCESS) linux.exit(126);
+    }
+
+    const devnull = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(devnull) != .SUCCESS) linux.exit(126);
+    const fd: posix.fd_t = @intCast(devnull);
+    if (linux.errno(linux.dup2(fd, 1)) != .SUCCESS) linux.exit(126);
+    if (linux.errno(linux.dup2(fd, 2)) != .SUCCESS) linux.exit(126);
+    if (fd > 2) {
+        _ = linux.close(fd);
+    } else {
+        if (linux.errno(linux.fcntl(fd, linux.F.SETFD, 0)) != .SUCCESS) linux.exit(126);
+    }
+
+    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", command.ptr };
+    _ = linux.execve("/bin/sh", &argv, envp);
+    linux.exit(127);
+}
+
+test "pipe command preserves input and redirects output with closed inherited descriptors" {
+    const linux = std.os.linux;
+    for (0..8) |closed_mask| {
+        // Isolate descriptor closure from the test runner, then exec a shell
+        // so the checks also catch CLOEXEC left on a standard descriptor.
+        const fork_rc = linux.fork();
+        try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+        const pid: posix.pid_t = @intCast(fork_rc);
+        if (pid == 0) {
+            for (0..3) |fd| {
+                if (closed_mask & (@as(usize, 1) << @intCast(fd)) != 0)
+                    _ = linux.close(@intCast(fd));
+            }
+            var fds: [2]posix.fd_t = undefined;
+            if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) linux.exit(120);
+            const text = "command output\n";
+            if (linux.write(fds[1], text, text.len) != text.len) linux.exit(121);
+            const envp = [_:null]?[*:0]const u8{};
+            runPipeCommandChild(
+                "IFS= read -r line && test \"$line\" = 'command output' && " ++
+                    "test /dev/null -ef /proc/self/fd/1 && test /dev/null -ef /proc/self/fd/2",
+                &envp,
+                null,
+                fds[0],
+                fds[1],
+            );
+        }
+        try std.testing.expectEqual(@as(u32, 0), try Pty.wait(pid));
+    }
+}
+
+fn writePipeCommandChild(output: []const u8, write_fd: posix.fd_t) noreturn {
+    const linux = std.os.linux;
+    // This child never execs, so CLOEXEC can't release the PTY, Wayland socket or other fds
+    // while a slow reader blocks it. Keep only the output pipe at fd 0.
+    if (linux.errno(linux.dup2(write_fd, 0)) != .SUCCESS) linux.exit(126);
+    if (linux.errno(linux.close_range(1, std.math.maxInt(posix.fd_t), .{
+        .UNSHARE = false,
+        .CLOEXEC = false,
+    })) != .SUCCESS) linux.exit(126);
+    writeAllFd(0, output);
+    linux.exit(0);
+}
+
+test "blocked pipe command writer releases inherited descriptors without losing output" {
+    const linux = std.os.linux;
+    var pipe: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })));
+    defer _ = linux.close(pipe[0]);
+    defer _ = linux.close(pipe[1]);
+    // Ensure the writer cannot finish until this test starts reading.
+    const capacity = linux.fcntl(pipe[1], linux.F.SETPIPE_SZ, 4096);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(capacity));
+    const output = try std.testing.allocator.alloc(u8, capacity * 4);
+    defer std.testing.allocator.free(output);
+    for (output, 0..) |*byte, i| byte.* = @truncate(i ^ (i >> 8));
+
+    var inherited: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&inherited, .{ .CLOEXEC = true })));
+    defer _ = linux.close(inherited[0]);
+    var inherited_writer_open = true;
+    defer if (inherited_writer_open) {
+        _ = linux.close(inherited[1]);
+    };
+
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    const pid: posix.pid_t = @intCast(fork_rc);
+    if (pid == 0) writePipeCommandChild(output, pipe[1]);
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, linux.SIG.KILL);
+        _ = Pty.wait(pid) catch {};
+    };
+    _ = linux.close(inherited[1]);
+    inherited_writer_open = false;
+
+    // CLOEXEC alone cannot release this pipe: the writer never execs.
+    // EOF must arrive while the output pipe is still blocked, not at exit.
+    var polls = [_]posix.pollfd{.{ .fd = inherited[0], .events = posix.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&polls, 2000));
+    var buf: [4096]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try posix.read(inherited[0], &buf));
+
+    var offset: usize = 0;
+    while (offset < output.len) {
+        polls[0] = .{ .fd = pipe[0], .events = posix.POLL.IN, .revents = 0 };
+        try std.testing.expectEqual(@as(usize, 1), try posix.poll(&polls, 2000));
+        const n = try posix.read(pipe[0], &buf);
+        try std.testing.expect(n > 0 and n <= output.len - offset);
+        try std.testing.expectEqualSlices(u8, output[offset..][0..n], buf[0..n]);
+        offset += n;
+    }
+    const status = try Pty.wait(pid);
+    reaped = true;
+    try std.testing.expectEqual(@as(u32, 0), status);
+}
+
+fn writeAllFd(fd: posix.fd_t, data: []const u8) void {
+    const linux = std.os.linux;
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const rc = linux.write(fd, data.ptr + offset, data.len - offset);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return;
+                offset += rc;
+            },
+            .INTR => {},
+            else => return,
+        }
+    }
+}
+
+/// Environment for a spawned process, with optional PWD and activation-token overrides.
+fn spawnEnvp(
+    self: *App,
+    arena: std.mem.Allocator,
+    pwd: ?[:0]const u8,
+    activation_token: ?[:0]const u8,
+) ![*:null]const ?[*:0]const u8 {
+    var list: std.ArrayList(?[*:0]const u8) = .empty;
+    for (self.environ.block.slice) |entry| {
+        const e = entry orelse continue;
+        if (pwd != null and std.mem.startsWith(u8, std.mem.span(e), "PWD=")) continue;
+        // Activation tokens are single-use and must not leak from the process
+        // that launched us into unrelated children.
+        if (std.mem.startsWith(u8, std.mem.span(e), "XDG_ACTIVATION_TOKEN=")) continue;
+        try list.append(arena, e);
+    }
+    if (pwd) |p| {
+        const entry = try std.mem.joinZ(arena, "", &.{ "PWD=", p });
+        try list.append(arena, entry.ptr);
+    }
+    if (activation_token) |token| {
+        const entry = try std.mem.joinZ(arena, "", &.{ "XDG_ACTIVATION_TOKEN=", token });
+        try list.append(arena, entry.ptr);
+    }
+    const slice = try list.toOwnedSliceSentinel(arena, null);
+    return slice.ptr;
+}
+
+fn applyConfig(self: *App, new_config: Config) !void {
+    const desired_font_size = Config.fontSizePixels(self.runtime_font_size orelse new_config.font_size, self.window.scale120);
+    const new_font: Font = try .init(
+        self.alloc,
+        new_config.font_family,
+        desired_font_size,
+        new_config.metric_adjustments,
+    );
+
+    self.applyColorDefaultsForConfig(new_config);
+    self.window.setBufferAlpha(new_config.background_opacity < 255);
+
+    if (new_config.image_storage_limit != self.config.image_storage_limit) {
+        self.term.setKittyGraphicsSizeLimit(self.alloc, new_config.image_storage_limit);
+    }
+
+    // Always rebuild the Font on reload to pick up fontconfig/file changes. The resize path
+    // decides whether changed metrics need to notify the pty and DEC 2048 listeners.
+    self.font.deinit(self.alloc);
+    self.font = new_font;
+    self.font_size_px = desired_font_size;
+    resizeForConfig(
+        self,
+        Window.physicalDimension(self.window.width, self.window.scale120),
+        Window.physicalDimension(self.window.height, self.window.scale120),
+        new_config,
+    ) catch |err| {
+        log.warn("config reload resize failed: {}", .{err});
+    };
+
+    self.resetSmoothScroll();
+    if (!new_config.inertial_scrolling) self.stopFling();
+    self.requestFullAsyncRedraw();
+}
+
+fn applyColorDefaultsForConfig(self: *App, config: Config) void {
+    var colors = config.terminalColors(self.alloc) catch |err| {
+        log.warn("failed to allocate terminal colors: {}", .{err});
+        return;
+    };
+    defer colors.palette.deinit(self.alloc);
+    self.term.colors.palette.changeDefault(self.alloc, colors.palette.original.*) catch |err| {
+        log.warn("failed to update terminal palette: {}", .{err});
+        return;
+    };
+    self.term.colors.background.default = colors.background.default;
+    self.term.colors.foreground.default = colors.foreground.default;
+    self.term.colors.cursor.default = colors.cursor.default;
+
+    self.selection_bg = colorWithRuntimeOverride(
+        config.effectiveSelectionBackground(),
+        self.selection_bg_override,
+    );
+    self.selection_fg = colorWithRuntimeOverride(
+        config.effectiveSelectionForeground(),
+        self.selection_fg_override,
+    );
+    self.cursor_color = config.effectiveCursorColor();
+    self.cursor_text = config.effectiveCursorText();
+}
+
+fn colorWithRuntimeOverride(default: vt.color.RGB, runtime: ?vt.color.RGB) vt.color.RGB {
+    return runtime orelse default;
+}
+
+test "runtime color override survives default changes until reset" {
+    const first_default: vt.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+    const next_default: vt.color.RGB = .{ .r = 4, .g = 5, .b = 6 };
+    const runtime: vt.color.RGB = .{ .r = 7, .g = 8, .b = 9 };
+
+    try std.testing.expectEqual(runtime, colorWithRuntimeOverride(first_default, runtime));
+    try std.testing.expectEqual(runtime, colorWithRuntimeOverride(next_default, runtime));
+    try std.testing.expectEqual(next_default, colorWithRuntimeOverride(next_default, null));
+}
+
+fn effectiveFontSize(self: *const App) Config.FontSize {
+    return self.runtime_font_size orelse self.config.font_size;
+}
+
+fn setRuntimeFontSize(self: *App, configured_size: ?Config.FontSize) void {
+    const next_size = configured_size orelse self.config.font_size;
+    const size_px = Config.fontSizePixels(next_size, self.window.scale120);
+    const new_font: Font = Font.init(
+        self.alloc,
+        self.config.font_family,
+        size_px,
+        self.config.metric_adjustments,
+    ) catch |err| {
+        log.warn("font size change failed: {}", .{err});
+        return;
+    };
+
+    self.runtime_font_size = configured_size;
+    self.font.deinit(self.alloc);
+    self.font = new_font;
+    self.font_size_px = size_px;
+    resize(
+        self,
+        Window.physicalDimension(self.window.width, self.window.scale120),
+        Window.physicalDimension(self.window.height, self.window.scale120),
+    ) catch |err| {
+        log.warn("font size change resize failed: {}", .{err});
+    };
+    self.requestFullAsyncRedraw();
+}
+
+fn adjustRuntimeFontSize(self: *App, delta: i32) void {
+    const current = self.effectiveFontSize();
+    const amount = @as(f32, @floatFromInt(delta));
+    const next: Config.FontSize = switch (current) {
+        .points => |value| .{ .points = std.math.clamp(value + amount, 1, 512) },
+        .pixels => |value| .{ .pixels = std.math.clamp(value + amount, 1, 512) },
+    };
+    if (std.meta.eql(next, current)) return;
+    self.setRuntimeFontSize(next);
+}
+
+fn resetRuntimeFontSize(self: *App) void {
+    if (self.runtime_font_size == null) return;
+    self.setRuntimeFontSize(null);
+}
+
+/// Feed PTY batches into the terminal, bounded to one ring so a flooding child can't
+/// starve Wayland; rearm() keeps the eventfd hot while batches remain.
+///
+/// The master never returns EIO/EOF (Pty.spawn keeps a slave fd); only SIGCHLD ends the session.
+fn drainPipeline(self: *App) !void {
+    self.pipeline.clearReady();
+    var consumed = false;
+    for (0..ReadPipeline.buffer_count) |_| {
+        const batch = self.pipeline.take() orelse break;
+        self.stream.nextSlice(batch);
+        self.pipeline.release();
+        consumed = true;
+        self.needs_redraw = true;
+    }
+    self.pipeline.rearm();
+    if (self.pipeline.hasFailed()) return error.PtyReadFailed;
+    self.syncPtyOutput(consumed);
+}
+
+fn syncPtyOutput(self: *App, consumed: bool) void {
+    self.syncInBandSizeReports();
+    self.syncSynchronizedOutput();
+    self.syncScrollTarget();
+    self.syncActiveScreen();
+    self.syncScrollbarHover();
+    if (consumed) self.syncHoveredLink(true);
+}
+
+fn drainPtyTail(fd: posix.fd_t, stream: anytype) !bool {
+    var consumed = false;
+    var buf: [16 * 1024]u8 = undefined;
+    while (true) {
+        const n = posix.read(fd, &buf) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        stream.nextSlice(buf[0..n]);
+        consumed = true;
+    }
+    return consumed;
+}
+
+fn handleOscColorOperation(
+    self: *App,
+    requests: *const vt.osc.color.List,
+    terminator: vt.osc.Terminator,
+) void {
+    var it = requests.constIterator(0);
+    while (it.next()) |req| {
+        switch (req.*) {
+            .set => |set| self.setOscColor(set),
+            .query => |target| self.answerOscSelectionColorQuery(target, terminator),
+            .reset => |target| self.resetOscColor(target),
+            else => {},
+        }
+    }
+}
+
+fn setOscColor(self: *App, set: vt.osc.color.ColoredTarget) void {
+    switch (set.target) {
+        .dynamic => |dynamic| switch (dynamic) {
+            .highlight_background => {
+                self.selection_bg_override = set.color;
+                self.selection_bg = set.color;
+            },
+            .highlight_foreground => {
+                self.selection_fg_override = set.color;
+                self.selection_fg = set.color;
+            },
+            else => return,
+        },
+        else => return,
+    }
+    self.requestFullAsyncRedraw();
+}
+
+fn resetOscColor(self: *App, target: vt.osc.color.Target) void {
+    switch (target) {
+        .dynamic => |dynamic| switch (dynamic) {
+            .highlight_background => {
+                self.selection_bg_override = null;
+                self.selection_bg = self.config.effectiveSelectionBackground();
+            },
+            .highlight_foreground => {
+                self.selection_fg_override = null;
+                self.selection_fg = self.config.effectiveSelectionForeground();
+            },
+            else => return,
+        },
+        else => return,
+    }
+    self.requestFullAsyncRedraw();
+}
+
+fn answerKittySelectionColorQueries(self: *App, request: vt.kitty.color.OSC) void {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+
+    const wrote_response = self.formatKittySelectionColorResponse(&writer.writer, request) catch return;
+    if (!wrote_response) return;
+
+    const response = writer.toOwnedSlice() catch return;
+    defer self.alloc.free(response);
+    self.writePty(response);
+}
+
+fn formatKittySelectionColorResponse(
+    self: *const App,
+    writer: *std.Io.Writer,
+    request: vt.kitty.color.OSC,
+) !bool {
+    var wrote_response = false;
+    for (request.list.items) |item| {
+        switch (item) {
+            .query => |key| {
+                const value = self.kittySelectionColorValue(key) orelse continue;
+                if (!wrote_response) {
+                    try writer.writeAll("\x1b]21");
+                    wrote_response = true;
+                }
+                try writeKittyColorReport(writer, key, value);
+            },
+            else => {},
+        }
+    }
+    if (wrote_response) try writer.writeAll(request.terminator.string());
+    return wrote_response;
+}
+
+const KittyColorValue = union(enum) {
+    color: vt.color.RGB,
+    unset,
+};
+
+fn kittySelectionColorValue(self: *const App, key: vt.kitty.color.Kind) ?KittyColorValue {
+    return switch (key) {
+        .palette => null,
+        .special => |special| switch (special) {
+            .selection_background => .{ .color = self.selection_bg },
+            .selection_foreground => if (self.selection_fg) |color|
+                .{ .color = color }
+            else
+                .unset,
+            .foreground,
+            .background,
+            .cursor,
+            .cursor_text,
+            .visual_bell,
+            .second_transparent_background,
+            => null,
+        },
+    };
+}
+
+fn writeKittyColorReport(
+    writer: *std.Io.Writer,
+    key: vt.kitty.color.Kind,
+    value: KittyColorValue,
+) !void {
+    try writer.print(";{f}=", .{key});
+    switch (value) {
+        .color => |color| try writeKittyColorValue(writer, color),
+        .unset => {},
+    }
+}
+
+fn writeKittyColorValue(writer: *std.Io.Writer, color: vt.color.RGB) !void {
+    try writer.print("rgb:{x:0>2}/{x:0>2}/{x:0>2}", .{ color.r, color.g, color.b });
+}
+
+fn setOsc52Clipboard(self: *App, kind: u8, data: []const u8) void {
+    if (data.len == 1 and data[0] == '?') {
+        self.beginOsc52Read(kind);
+        return;
+    }
+
+    const text = decodeOsc52ClipboardData(self.alloc, data) catch |err| {
+        switch (err) {
+            error.OutOfMemory => log.warn("out of memory decoding OSC 52 clipboard data", .{}),
+            else => log.info("application sent invalid base64 data for OSC 52", .{}),
+        }
+        return;
+    };
+
+    switch (osc52Target(kind)) {
+        .clipboard => _ = self.clipboard.claim(.clipboard, text, self.last_serial),
+        .primary => _ = self.clipboard.claim(.primary, text, self.last_serial),
+    }
+}
+
+fn beginOsc52Read(self: *App, kind: u8) void {
+    const target: Clipboard.Target = switch (osc52Target(kind)) {
+        .clipboard => .clipboard,
+        .primary => .primary,
+    };
+    switch (self.clipboard.request(target, .{ .osc52_read = kind })) {
+        .started => {},
+        .busy, .unavailable => self.writeOsc52ClipboardReport(kind, ""),
+    }
+}
+
+fn writeOsc52ClipboardReport(self: *App, kind: u8, data: []const u8) void {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    formatOsc52ClipboardReport(&writer.writer, kind, data) catch return;
+    const response = writer.toOwnedSlice() catch return;
+    defer self.alloc.free(response);
+    self.writePty(response);
+}
+
+fn formatOsc52ClipboardReport(writer: *std.Io.Writer, kind: u8, data: []const u8) !void {
+    const enc = std.base64.standard.Encoder;
+    var encoded_buf: [4096]u8 = undefined;
+    if (enc.calcSize(data.len) <= encoded_buf.len) {
+        const payload = enc.encode(&encoded_buf, data);
+        try writer.print("\x1b]52;{c};{s}\x07", .{ kind, payload });
+        return;
+    }
+
+    try writer.print("\x1b]52;{c};", .{kind});
+    try enc.encodeWriter(writer, data);
+    try writer.writeByte(0x07);
+}
+
+const Osc52Target = enum { clipboard, primary };
+
+fn osc52Target(kind: u8) Osc52Target {
+    return switch (kind) {
+        's', 'p' => .primary,
+        else => .clipboard,
+    };
+}
+
+fn decodeOsc52ClipboardData(alloc: std.mem.Allocator, data: []const u8) ![:0]const u8 {
+    const dec = std.base64.standard.Decoder;
+    const size = try dec.calcSizeForSlice(data);
+    const buf = try alloc.allocSentinel(u8, size, 0);
+    errdefer alloc.free(buf);
+    try dec.decode(buf, data);
+    return buf;
+}
+
+fn answerOscSelectionColorQuery(
+    self: *App,
+    target: vt.osc.color.Target,
+    terminator: vt.osc.Terminator,
+) void {
+    switch (target) {
+        .palette => {},
+        .dynamic => |dynamic| switch (dynamic) {
+            .highlight_background => self.writeOscDynamicReport(17, self.selection_bg, terminator),
+            .highlight_foreground => self.writeOscDynamicReport(
+                19,
+                self.selection_fg orelse self.effectiveForeground(),
+                terminator,
+            ),
+            .foreground,
+            .background,
+            .cursor,
+            .pointer_foreground,
+            .pointer_background,
+            .tektronix_foreground,
+            .tektronix_background,
+            .tektronix_cursor,
+            => {},
+        },
+        .special => {},
+    }
+}
+
+fn writeOscDynamicReport(
+    self: *App,
+    dynamic: u16,
+    color: vt.color.RGB,
+    terminator: vt.osc.Terminator,
+) void {
+    self.writeOscColorReport(.{ .dynamic = dynamic }, color, terminator);
+}
+
+const OscColorReport = union(enum) {
+    palette: u8,
+    dynamic: u16,
+};
+
+fn writeOscColorReport(
+    self: *App,
+    report: OscColorReport,
+    color: vt.color.RGB,
+    terminator: vt.osc.Terminator,
+) void {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    formatOscColorReport(&writer, report, color, terminator) catch return;
+    self.writePty(writer.buffered());
+}
+
+fn formatOscColorReport(
+    writer: *std.Io.Writer,
+    report: OscColorReport,
+    color: vt.color.RGB,
+    terminator: vt.osc.Terminator,
+) !void {
+    switch (report) {
+        .palette => |idx| try writer.print(
+            "\x1b]4;{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}",
+            .{
+                idx,
+                @as(u16, color.r) * 257,
+                @as(u16, color.g) * 257,
+                @as(u16, color.b) * 257,
+            },
+        ),
+        .dynamic => |dynamic| try writer.print(
+            "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}",
+            .{
+                dynamic,
+                @as(u16, color.r) * 257,
+                @as(u16, color.g) * 257,
+                @as(u16, color.b) * 257,
+            },
+        ),
+    }
+    try writer.writeAll(terminator.string());
+}
+
+fn effectiveForeground(self: *const App) vt.color.RGB {
+    return self.term.colors.foreground.get() orelse self.term.colors.palette.current[7];
+}
+
+fn syncCursorShape(self: *App) void {
+    self.window.setCursorShape(self.currentCursorShape());
+}
+
+fn currentCursorShape(self: *App) Window.CursorShape {
+    if (self.scrollbar_hovered or self.scrollbar_drag != null or self.scrollbarThumbHit() != null) return .default;
+    if (self.hoveredLinkUri() != null) return .pointer;
+    if (self.mouse_shape_explicit) return cursorShapeFromMouseShape(self.term.mouse_shape);
+    return if (self.term.flags.mouse_event != .none) .default else .text;
+}
+
+fn linkModifiersActive(mods: vt.input.KeyMods, mouse_reporting: bool) bool {
+    if (!mods.ctrl or mods.alt or mods.super) return false;
+    return mods.shift or !mouse_reporting;
+}
+
+fn linksActive(self: *App) bool {
+    return linkModifiersActive(
+        self.keyboard.currentMods(),
+        self.term.flags.mouse_event != .none,
+    );
+}
+
+fn cursorShapeFromMouseShape(shape: vt.MouseShape) Window.CursorShape {
+    return switch (shape) {
+        .default => .default,
+        .context_menu => .context_menu,
+        .help => .help,
+        .pointer => .pointer,
+        .progress => .progress,
+        .wait => .wait,
+        .cell => .cell,
+        .crosshair => .crosshair,
+        .text => .text,
+        .vertical_text => .vertical_text,
+        .alias => .alias,
+        .copy => .copy,
+        .move => .move,
+        .no_drop => .no_drop,
+        .not_allowed => .not_allowed,
+        .grab => .grab,
+        .grabbing => .grabbing,
+        .all_scroll => .all_scroll,
+        .col_resize => .col_resize,
+        .row_resize => .row_resize,
+        .n_resize => .n_resize,
+        .e_resize => .e_resize,
+        .s_resize => .s_resize,
+        .w_resize => .w_resize,
+        .ne_resize => .ne_resize,
+        .nw_resize => .nw_resize,
+        .se_resize => .se_resize,
+        .sw_resize => .sw_resize,
+        .ew_resize => .ew_resize,
+        .ns_resize => .ns_resize,
+        .nesw_resize => .nesw_resize,
+        .nwse_resize => .nwse_resize,
+        .zoom_in => .zoom_in,
+        .zoom_out => .zoom_out,
+    };
+}
+
+test "link modifiers are exact and shift bypasses mouse reporting" {
+    try std.testing.expect(linkModifiersActive(.{ .ctrl = true }, false));
+    try std.testing.expect(linkModifiersActive(.{ .ctrl = true, .shift = true }, false));
+    try std.testing.expect(linkModifiersActive(.{ .ctrl = true, .caps_lock = true }, false));
+    try std.testing.expect(!linkModifiersActive(.{ .ctrl = true, .alt = true }, false));
+    try std.testing.expect(!linkModifiersActive(.{ .ctrl = true, .super = true }, false));
+    try std.testing.expect(!linkModifiersActive(.{ .shift = true }, false));
+    try std.testing.expect(!linkModifiersActive(.{ .ctrl = true }, true));
+    try std.testing.expect(linkModifiersActive(.{ .ctrl = true, .shift = true }, true));
+}
+
+test "OSC color reports use 16-bit rgb format" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try formatOscColorReport(
+        &writer,
+        .{ .dynamic = 10 },
+        .{ .r = 0x12, .g = 0x34, .b = 0x56 },
+        .st,
+    );
+    try std.testing.expectEqualStrings("\x1b]10;rgb:1212/3434/5656\x1b\\", writer.buffered());
+
+    writer = .fixed(&buf);
+    try formatOscColorReport(
+        &writer,
+        .{ .palette = 7 },
+        .{ .r = 0xab, .g = 0xcd, .b = 0xef },
+        .bel,
+    );
+    try std.testing.expectEqualStrings("\x1b]4;7;rgb:abab/cdcd/efef\x07", writer.buffered());
+}
+
+test "kitty color reports use OSC 21 key value format" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try writer.writeAll("\x1b]21");
+    try writeKittyColorReport(
+        &writer,
+        .{ .special = .foreground },
+        .{ .color = .{ .r = 0x12, .g = 0x34, .b = 0x56 } },
+    );
+    try writeKittyColorReport(&writer, .{ .special = .cursor }, .unset);
+    try writeKittyColorReport(
+        &writer,
+        .{ .palette = 7 },
+        .{ .color = .{ .r = 0xab, .g = 0xcd, .b = 0xef } },
+    );
+    try writer.writeAll(vt.osc.Terminator.st.string());
+
+    try std.testing.expectEqualStrings(
+        "\x1b]21;foreground=rgb:12/34/56;cursor=;7=rgb:ab/cd/ef\x1b\\",
+        writer.buffered(),
+    );
+}
+
+test "OSC 52 set decodes clipboard payload" {
+    const text = try decodeOsc52ClipboardData(std.testing.allocator, "aGVsbG8=");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("hello", text);
+
+    try std.testing.expectEqual(.clipboard, osc52Target('c'));
+    try std.testing.expectEqual(.primary, osc52Target('s'));
+    try std.testing.expectEqual(.primary, osc52Target('p'));
+    try std.testing.expectEqual(.clipboard, osc52Target('7'));
+}
+
+test "OSC 52 set rejects invalid base64 padding" {
+    // Early padding can leave part or all of the destination unwritten.
+    for ([_][]const u8{ "=AAA", "AA=A", "A===", "aGVsbG9=" }) |payload| {
+        try std.testing.expectError(error.InvalidPadding, decodeOsc52ClipboardData(std.testing.allocator, payload));
+    }
+    try std.testing.expectError(error.InvalidCharacter, decodeOsc52ClipboardData(std.testing.allocator, "!!!!"));
+}
+
+test "OSC 52 read reports base64 clipboard payload" {
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try formatOsc52ClipboardReport(&writer, 'c', "hello");
+    try std.testing.expectEqualStrings("\x1b]52;c;aGVsbG8=\x07", writer.buffered());
+}
+
+test "busy OSC 52 read replies empty without disturbing the active transfer" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var incoming: [2]posix.fd_t = undefined;
+    var output: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&incoming, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    try std.testing.expectEqual(@as(usize, 5), linux.write(incoming[1], "hello", 5));
+    _ = linux.close(incoming[1]);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(output[0]);
+    defer _ = linux.close(output[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.clipboard = .init(alloc, null, null);
+    defer app.clipboard.deinit();
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+    app.pty.master = output[1];
+    app.clipboard.transfer_fd = incoming[0];
+    app.clipboard.transfer_action = .{ .osc52_read = .{ .kind = 'c', .mime = "UTF8_STRING" } };
+
+    app.beginOsc52Read('p');
+    var buf: [64]u8 = undefined;
+    const busy_len = try posix.read(output[0], &buf);
+    try std.testing.expectEqualStrings("\x1b]52;p;\x07", buf[0..busy_len]);
+    try std.testing.expectEqual(incoming[0], app.clipboard.transferFd());
+    try std.testing.expectEqual(@as(?u8, 'c'), app.clipboard.osc52ReadKind());
+
+    const event = (try app.clipboard.readTransfer()).?;
+    try std.testing.expectEqual(@as(u8, 'c'), event.osc52_read.kind);
+    try std.testing.expectEqualStrings("hello", event.osc52_read.data);
+    app.writeOsc52ClipboardReport(event.osc52_read.kind, event.osc52_read.data);
+    app.clipboard.finishEvent();
+    const completed_len = try posix.read(output[0], &buf);
+    try std.testing.expectEqualStrings("\x1b]52;c;aGVsbG8=\x07", buf[0..completed_len]);
+    try std.testing.expectError(error.WouldBlock, posix.read(output[0], &buf));
+}
+
+test "kitty f=100 accepts an SVG document" {
+    const doc = "<svg xmlns='http://www.w3.org/2000/svg' width='6' height='3'>" ++
+        "<rect width='6' height='3' fill='#00ff00'/></svg>";
+    const img = try decodePng(std.testing.allocator, doc);
+    defer std.testing.allocator.free(img.data);
+    try std.testing.expectEqual(@as(u32, 6), img.width);
+    try std.testing.expectEqual(@as(u32, 3), img.height);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, img.data[0..4]);
+}
+
+test "PNG decode rejects oversized dimensions before rasterization" {
+    const encoded = "iVBORw0KGgoAAAANSUhEUgAAJxEAAAABCAYAAACXHN81AAAAPUlEQVR42u3BMQEAAADCoPVP7W0HoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgDOcRQABLx9QIgAAAABJRU5ErkJggg==";
+    const decoder = std.base64.standard.Decoder;
+    const png = try std.testing.allocator.alloc(u8, try decoder.calcSizeForSlice(encoded));
+    defer std.testing.allocator.free(png);
+    try decoder.decode(png, encoded);
+
+    try std.testing.expectError(error.InvalidData, decodePng(std.testing.allocator, png));
+}
+
+test "kitty PNG direct transmit installs decoded RGBA image" {
+    const alloc = std.testing.allocator;
+    const old_decode_png = vt.sys.decode_png;
+    vt.sys.decode_png = decodePng;
+    defer vt.sys.decode_png = old_decode_png;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 10 });
+    defer term.deinit(alloc);
+
+    var command: std.Io.Writer.Allocating = .init(alloc);
+    defer command.deinit();
+    try command.writer.print("\x1b_Ga=T,f=100,i=7;{s}\x1b\\", .{
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+    });
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(command.writer.buffered());
+
+    const img = term.screens.active.kitty_images.imageById(7) orelse return error.MissingImage;
+    try std.testing.expectEqual(.rgba, img.format);
+    try std.testing.expect(img.width > 0);
+    try std.testing.expect(img.height > 0);
+    try std.testing.expectEqual(@as(usize, img.width) * img.height * 4, img.data.len());
+    try std.testing.expectEqual(@as(usize, 1), term.screens.active.kitty_images.placements.count());
+}
+
+test "DA1 advertises OSC 52 clipboard support" {
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try deviceAttributes().encode(.primary, &writer);
+    try std.testing.expectEqualStrings("\x1b[?62;22;52c", writer.buffered());
+}
+
+test "portal appearance values map to application preferences" {
+    try std.testing.expectEqual(vt.device_status.ColorScheme.dark, portalColorScheme(0));
+    try std.testing.expectEqual(vt.device_status.ColorScheme.dark, portalColorScheme(1));
+    try std.testing.expectEqual(vt.device_status.ColorScheme.light, portalColorScheme(2));
+    try std.testing.expectEqual(vt.device_status.ColorScheme.dark, portalColorScheme(99));
+
+    try std.testing.expect(!portalReducedMotion(0));
+    try std.testing.expect(portalReducedMotion(1));
+    try std.testing.expect(!portalReducedMotion(99));
+}
+
+/// DEC mode 2048 (in-band size reports): send a report on enable and on every resize
+/// while enabled. Mode actions send the immediate report; this end-of-chunk sync is a
+/// fallback for state changes that bypass AppStreamHandler.
+fn syncInBandSizeReports(self: *App) void {
+    const enabled = self.term.modes.get(.in_band_size_reports);
+    if (enabled and !self.in_band_reports) self.sendSizeReport();
+    self.in_band_reports = enabled;
+}
+
+fn sendSizeReport(self: *App) void {
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    vt.size_report.encode(&writer, .mode_2048, self.currentSize()) catch return;
+    self.writePty(writer.buffered());
+}
+
+/// DEC mode 2026 (synchronized output): state may change but frames hide the intermediate
+/// state. A one-shot timer stops a misbehaving child from freezing output.
+fn syncSynchronizedOutput(self: *App) void {
+    const enabled = self.term.modes.get(.synchronized_output);
+    if (enabled == self.sync_output) return;
+
+    self.sync_output = enabled;
+    if (enabled) {
+        _ = setTimer(self.sync_output_fd, .{
+            .it_value = timespecFromNs(sync_output_reset_ms * std.time.ns_per_ms),
+            .it_interval = .{ .sec = 0, .nsec = 0 },
+        }, "synchronized output");
+    } else {
+        _ = setTimer(self.sync_output_fd, disarmed_timer, "synchronized output");
+        self.needs_redraw = true;
+    }
+}
+
+fn fireSyncOutputReset(self: *App) void {
+    _ = readTimer(self.sync_output_fd) orelse return;
+    if (self.term.modes.get(.synchronized_output)) {
+        log.debug("synchronized output timed out; forcing redraw", .{});
+        self.term.modes.set(.synchronized_output, false);
+    }
+    self.syncSynchronizedOutput();
+}
+
+fn armTaskbarProgressTimer(self: *App) void {
+    _ = setTimer(self.taskbar_progress_fd, .{
+        .it_value = .{ .sec = taskbar_progress_timeout_seconds, .nsec = 0 },
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    }, "taskbar progress");
+}
+
+fn stopTaskbarProgressTimer(self: *App) void {
+    _ = setTimer(self.taskbar_progress_fd, disarmed_timer, "taskbar progress");
+}
+
+fn fireTaskbarProgressTimeout(self: *App) void {
+    _ = readTimer(self.taskbar_progress_fd) orelse return;
+    self.sendTaskbarProgress(.{ .state = .remove }) catch |err| {
+        if (err != error.DBusUnavailable) {
+            log.warn("failed to clear stale taskbar progress: {}", .{err});
+        }
+    };
+}
+
+/// Window pointer delegate: track position and accumulate wheel scroll,
+/// applying it at frame boundaries.
+fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    self.syncScrollTarget();
+    switch (event) {
+        .enter => |enter| {
+            self.pointer_x = enter.surface_x.toDouble();
+            self.pointer_y = enter.surface_y.toDouble();
+            self.pointer_inside = true;
+            self.syncScrollbarHoverFromPointer();
+            self.syncHoveredLink(false);
+            self.syncCursorShape();
+        },
+        .motion => |motion| {
+            self.pointer_x = motion.surface_x.toDouble();
+            self.pointer_y = motion.surface_y.toDouble();
+            self.updateDragPress();
+            if (self.scrollbar_drag != null) {
+                self.dragScrollbar();
+                return;
+            }
+            self.syncScrollbarHoverFromPointer();
+            self.syncHoveredLink(false);
+            if (self.selecting) {
+                self.extendSelection();
+            } else if (self.mouse_button != null or self.reportingMouse()) {
+                self.sendMouseEvent(.{
+                    .action = .motion,
+                    .button = self.mouse_button,
+                    .mods = self.keyboard.currentMods(),
+                    .pos = self.pointerPosPhysical(),
+                });
+            }
+        },
+        .axis => |axis| {
+            self.stopFling();
+            if (axis.axis == .vertical_scroll and !self.scroll_had_discrete and !self.scroll_had_value120) {
+                const pixels = axis.value.toDouble();
+                self.scroll_pixels += pixels;
+                self.scroll_frame_pixels += pixels;
+                self.scroll_time_ms = axis.time;
+                self.scroll_had_pixels = true;
+            }
+            if (!self.window.pointerHasFrames()) self.finishScrollFrame();
+        },
+        .axis_discrete => |discrete| {
+            self.stopFling();
+            if (discrete.axis == .vertical_scroll) {
+                self.scroll_clicks += discrete.discrete;
+                self.scroll_had_discrete = true;
+            }
+        },
+        .axis_value120 => |axis| {
+            self.stopFling();
+            if (axis.axis == .vertical_scroll) {
+                self.scroll_value120 += axis.value120;
+                self.scroll_had_value120 = true;
+            }
+        },
+        .frame => self.finishScrollFrame(),
+        .button => |button| {
+            self.last_serial = button.serial;
+            if (button.state == .pressed) self.stopFling();
+            if (button.button == 272) { // BTN_LEFT
+                if (button.state == .released) self.endDragPress();
+                if (button.state == .pressed and self.beginScrollbarDrag()) return;
+                if (button.state == .released and self.finishScrollbarDrag()) return;
+            }
+            // Mouse reporting wins when the application asked for it,
+            // except that shift bypasses it for terminal-side selection.
+            const reporting = self.term.flags.mouse_event != .none and
+                !self.keyboard.currentMods().shift;
+            const mouse_button = mouseButtonFromEvdev(button.button);
+
+            if (button.button == 272) { // BTN_LEFT
+                if (button.state == .pressed) {
+                    if (self.armLinkPress(button.button, .open)) {
+                        self.syncScrollbarHover();
+                        return;
+                    }
+                    self.cancelLinkPress();
+                }
+                if (button.state == .released and self.finishLinkPress(button.button)) {
+                    self.syncScrollbarHover();
+                    return;
+                }
+                switch (button.state) {
+                    .pressed => if (reporting) {
+                        self.forwardMouseButton(button, mouse_button.?);
+                    } else {
+                        self.startSelection(button.time);
+                        self.syncScrollbarHover();
+                    },
+                    // Routing may have changed since the press (shift released, mouse mode toggled): an
+                    // armed drag always finishes; only presses the app saw get their release.
+                    .released => if (self.selecting) {
+                        self.finishSelection();
+                        self.syncScrollbarHover();
+                    } else if (self.mouse_button == mouse_button) {
+                        self.forwardMouseButton(button, mouse_button.?);
+                    } else if (reporting) {
+                        self.forwardMouseButton(button, mouse_button.?);
+                    },
+                    else => {},
+                }
+                if (button.state == .pressed) self.armDragPress(button.serial);
+                return;
+            }
+
+            if (button.button == 273) { // BTN_RIGHT
+                if (button.state == .pressed) {
+                    if (self.armLinkPress(button.button, .copy)) return;
+                    self.cancelLinkPress();
+                }
+                if (button.state == .released and self.finishLinkPress(button.button)) return;
+            }
+
+            if (reporting and mouse_button != null) {
+                self.forwardMouseButton(button, mouse_button.?);
+                return;
+            }
+            if (button.button == 274 and button.state == .pressed) {
+                // BTN_MIDDLE: paste the primary selection.
+                self.beginPaste(.primary);
+            }
+        },
+        .axis_source => |source| self.scroll_source = source.axis_source,
+        .axis_stop => |stop| {
+            if (stop.axis == .vertical_scroll) self.scroll_stop_time_ms = stop.time;
+        },
+        // Terminal scrolling follows the compositor-provided logical axis;
+        // the physical direction hint does not change that behavior.
+        .axis_relative_direction => {},
+        .leave => {
+            self.endDragPress();
+            self.pointer_inside = false;
+            self.syncScrollbarHover();
+            self.syncHoveredLink(false);
+        },
+    }
+}
+
+fn pointerSurfacePhysical(self: *const App) struct { x: f64, y: f64 } {
+    const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
+    return .{
+        .x = @max(0, self.pointer_x * scale),
+        .y = @max(0, self.pointer_y * scale),
+    };
+}
+
+fn scrollbarPointerEligible(self: *App) bool {
+    if (!self.pointer_inside or self.term.screens.active_key != .primary or
+        self.scrollbar_drag != null or self.selecting or self.mouse_button != null or
+        self.link_press != null)
+    {
+        return false;
+    }
+    const scrollbar = self.term.screens.active.pages.scrollbar();
+    return scrollbar.total > scrollbar.len;
+}
+
+fn scrollbarRevealHovered(self: *App) bool {
+    if (!self.scrollbarPointerEligible()) return false;
+    const pos = self.pointerSurfacePhysical();
+    const reveal_width = Window.physicalDimension(scrollbar_reveal_width, self.window.scale120);
+    const reveal_left = self.layout.surface_width -| reveal_width;
+    return pos.x >= reveal_left and pos.x < self.layout.surface_width and
+        pos.y >= self.layout.grid_y and pos.y < self.layout.grid_y + self.layout.grid_height;
+}
+
+fn syncScrollbarHover(self: *App) void {
+    const reveal_hovered = self.scrollbarRevealHovered();
+    const hovered = reveal_hovered and self.scrollbarThumbUnderPointer() != null;
+    if (reveal_hovered == self.scrollbar_reveal_hovered and hovered == self.scrollbar_hovered) return;
+    self.scrollbar_reveal_hovered = reveal_hovered;
+    self.scrollbar_hovered = hovered;
+    if (reveal_hovered) {
+        self.revealScrollbar();
+    } else {
+        const scrollbar = self.term.screens.active.pages.scrollbar();
+        if (self.term.screens.active_key != .primary or scrollbar.total <= scrollbar.len) {
+            self.hideScrollbar();
+        } else if (self.scrollbar_alpha > 0) {
+            const changed = self.scrollbar_alpha != scrollbar_default_alpha;
+            self.scrollbar_alpha = scrollbar_default_alpha;
+            self.armScrollbarHold();
+            if (changed) self.requestFullAsyncRedraw();
+        }
+    }
+    self.syncCursorShape();
+}
+
+fn syncScrollbarHoverFromPointer(self: *App) void {
+    self.syncScrollbarHover();
+    if (self.scrollbar_reveal_hovered) self.revealScrollbar();
+}
+
+fn scrollbarThumbUnderPointer(self: *App) ?ScrollbarGeometry {
+    if (!self.scrollbarPointerEligible()) return null;
+    const geometry = self.currentScrollbarGeometry(scrollbar_default_alpha) orelse return null;
+    const pos = self.pointerSurfacePhysical();
+    const hit_width = @max(geometry.thumb.width, Window.physicalDimension(scrollbar_hit_width, self.window.scale120));
+    const hit_left = self.layout.surface_width -| hit_width;
+    const thumb_bottom = geometry.thumb.y + @as(f64, @floatFromInt(geometry.thumb.height));
+    if (pos.x < hit_left or pos.x >= self.layout.surface_width or
+        pos.y < geometry.thumb.y or pos.y >= thumb_bottom) return null;
+    return geometry;
+}
+
+fn scrollbarThumbHit(self: *App) ?ScrollbarGeometry {
+    if (self.scrollbar_alpha == 0) return null;
+    const scrollbar = self.term.screens.active.pages.scrollbar();
+    if (!scrollbarShouldRender(scrollbar, self.scrollbar_alpha)) return null;
+    return self.scrollbarThumbUnderPointer();
+}
+
+fn beginScrollbarDrag(self: *App) bool {
+    const geometry = self.scrollbarThumbHit() orelse return false;
+    const pos = self.pointerSurfacePhysical();
+    self.cancelDrag();
+    self.cancelLinkPress();
+    self.scrollbar_reveal_hovered = false;
+    self.scrollbar_hovered = false;
+    self.scrollbar_drag = .{
+        .grab_offset = std.math.clamp(
+            pos.y - geometry.thumb.y,
+            0,
+            @as(f64, @floatFromInt(geometry.thumb.height)),
+        ),
+        .screen = self.term.screens.active_key,
+    };
+    self.revealScrollbar();
+    self.syncHoveredLink(true);
+    self.syncCursorShape();
+    return true;
+}
+
+fn dragScrollbar(self: *App) void {
+    const drag = self.scrollbar_drag orelse return;
+    if (drag.screen != self.term.screens.active_key) return;
+    const geometry = self.currentScrollbarGeometry(scrollbar_hover_alpha) orelse return;
+    const pos = self.pointerSurfacePhysical();
+    const row = scrollbarRowForThumbY(geometry, pos.y - drag.grab_offset);
+    self.resetSmoothScroll();
+    self.term.screens.active.pages.scroll(.{ .row = row });
+    self.revealScrollbar();
+    self.needs_redraw = true;
+    self.syncHoveredLink(true);
+}
+
+fn finishScrollbarDrag(self: *App) bool {
+    if (self.scrollbar_drag == null) return false;
+    self.scrollbar_drag = null;
+    self.syncScrollbarHover();
+    self.revealScrollbar();
+    self.syncHoveredLink(true);
+    self.syncCursorShape();
+    return true;
+}
+
+/// The viewport cell under the pointer, clamped to the grid.
+fn cellAtPointer(self: *App) struct { x: u16, y: u16 } {
+    const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
+    const px: f64 = @max(0, self.pointer_x * scale - @as(f64, @floatFromInt(self.layout.grid_x)));
+    const py: f64 = @max(0, self.pointer_y * scale - @as(f64, @floatFromInt(self.layout.grid_y))) +
+        @as(f64, @floatFromInt(self.scroll_offset));
+    const x: u16 = @intFromFloat(@min(
+        px / @as(f64, @floatFromInt(self.font.cell_width)),
+        @as(f64, @floatFromInt(self.term.cols -| 1)),
+    ));
+    const y: u16 = @intFromFloat(@min(
+        py / @as(f64, @floatFromInt(self.font.cell_height)),
+        @as(f64, @floatFromInt(self.term.rows -| @intFromBool(self.scroll_offset == 0))),
+    ));
+    return .{ .x = x, .y = y };
+}
+
+fn pinAtPointer(self: *App) ?vt.Pin {
+    const cell = self.cellAtPointer();
+    return self.term.screens.active.pages.pin(.{
+        .viewport = .{ .x = cell.x, .y = cell.y },
+    });
+}
+
+/// Unlike selection coordinates, link coordinates must be inside the grid;
+/// padding must not clamp to a clickable edge cell.
+fn linkCellAtPointer(self: *App) ?vt.Coordinate {
+    if (!self.pointer_inside) return null;
+    if (self.scrollbar_hovered or self.scrollbar_drag != null or self.scrollbarThumbHit() != null) return null;
+    const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
+    const px = self.pointer_x * scale;
+    const py = self.pointer_y * scale;
+    const grid_x: f64 = @floatFromInt(self.layout.grid_x);
+    const grid_y: f64 = @floatFromInt(self.layout.grid_y);
+    const grid_right: f64 = @floatFromInt(self.layout.grid_x + self.layout.grid_width);
+    const grid_bottom: f64 = @floatFromInt(self.layout.grid_y + self.layout.grid_height);
+    if (px < grid_x or px >= grid_right or py < grid_y or py >= grid_bottom) return null;
+    return .{
+        .x = @intFromFloat((px - grid_x) / @as(f64, @floatFromInt(self.font.cell_width))),
+        .y = @intFromFloat((py - grid_y + @as(f64, @floatFromInt(self.scroll_offset))) /
+            @as(f64, @floatFromInt(self.font.cell_height))),
+    };
+}
+
+fn linkPinAtPointer(self: *App) ?vt.Pin {
+    const cell = self.linkCellAtPointer() orelse return null;
+    return self.term.screens.active.pages.pin(.{ .viewport = cell });
+}
+
+fn oscHyperlinkAtPin(pin: vt.Pin) ?[]const u8 {
+    const page = pin.node.page();
+    const rac = pin.rowAndCell();
+    if (!rac.cell.hyperlink) return null;
+    const link_id = page.lookupHyperlink(rac.cell) orelse return null;
+    const entry = page.hyperlink_set.get(page.memory, link_id);
+    return entry.uri.slice(page.memory);
+}
+
+fn detectHoveredLink(self: *App) !?HoveredLink {
+    const pin = self.linkPinAtPointer() orelse return null;
+    if (oscHyperlinkAtPin(pin)) |uri| {
+        return .{ .uri = try self.alloc.dupe(u8, uri), .range = null };
+    }
+
+    const screen = self.term.screens.active;
+    const line = screen.selectLine(.{
+        .pin = pin,
+        .whitespace = null,
+        .semantic_prompt_boundary = true,
+    }) orelse return null;
+    var strmap = try screen.selectionStringMap(self.alloc, .{
+        .sel = line,
+        .trim = false,
+    });
+    defer strmap.deinit(self.alloc);
+    const text = strmap.string;
+
+    var offset: usize = 0;
+    while (Link.find(text, offset)) |match| {
+        if (match.end > strmap.map.count()) break;
+        const selection: vt.Selection = .init(
+            strmap.map.get(match.start).?,
+            strmap.map.get(match.end - 1).?,
+            false,
+        );
+        if (selection.contains(screen, pin)) {
+            return .{
+                .uri = try self.alloc.dupe(u8, text[match.start..match.end]),
+                .range = self.linkRange(selection),
+            };
+        }
+        offset = match.end;
+    }
+    return null;
+}
+
+fn linkRange(self: *App, selection: vt.Selection) ?Renderer.LinkRange {
+    const screen = self.term.screens.active;
+    return highlightRange(
+        screen,
+        selection.topLeft(screen),
+        selection.bottomRight(screen),
+        self.term.rows +| @intFromBool(self.scroll_offset != 0),
+        self.term.cols,
+    );
+}
+
+fn highlightRange(
+    screen: *vt.Screen,
+    start: vt.Pin,
+    end: vt.Pin,
+    rows: u16,
+    cols: u16,
+) ?Renderer.LinkRange {
+    const tl = screen.pages.pointFromPin(.screen, start) orelse return null;
+    const br = screen.pages.pointFromPin(.screen, end) orelse return null;
+    const viewport = screen.pages.pointFromPin(.screen, screen.pages.getTopLeft(.viewport)) orelse return null;
+    const last_y = viewport.screen.y + rows - 1;
+    if (br.screen.y < viewport.screen.y or tl.screen.y > last_y) return null;
+
+    return .{
+        .start = .{
+            .x = if (tl.screen.y < viewport.screen.y) 0 else tl.screen.x,
+            .y = @max(tl.screen.y, viewport.screen.y) - viewport.screen.y,
+        },
+        .end = .{
+            .x = if (br.screen.y > last_y) cols - 1 else br.screen.x,
+            .y = @min(br.screen.y, last_y) - viewport.screen.y,
+        },
+    };
+}
+
+fn hoveredLinksEqual(a: ?HoveredLink, b: ?HoveredLink) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?.uri, b.?.uri) and std.meta.eql(a.?.range, b.?.range);
+}
+
+/// Recompute the link only while the exact activation modifiers are held.
+/// Repeated pointer motion inside one cell is deliberately a no-op.
+fn syncHoveredLink(self: *App, force: bool) void {
+    const active = self.linksActive();
+    const activation_changed = active != self.link_active;
+    self.link_active = active;
+    const cell = if (active) self.linkCellAtPointer() else null;
+    if (!force and !activation_changed and std.meta.eql(cell, self.link_checked_cell)) return;
+    self.link_checked_cell = cell;
+
+    const next: ?HoveredLink = if (cell != null)
+        self.detectHoveredLink() catch |err| next: {
+            log.warn("automatic link detection failed: {}", .{err});
+            break :next null;
+        }
+    else
+        null;
+    const changed = !hoveredLinksEqual(self.hovered_link, next);
+    if (changed) {
+        if (self.hovered_link) |old| self.alloc.free(old.uri);
+        self.hovered_link = next;
+    } else if (next) |unchanged| {
+        self.alloc.free(unchanged.uri);
+    }
+    if (changed or activation_changed) self.requestFullAsyncRedraw();
+    self.syncCursorShape();
+}
+
+fn hoveredLinkUri(self: *App) ?[]const u8 {
+    if (!self.linksActive()) return null;
+    const link = self.hovered_link orelse return null;
+    return link.uri;
+}
+
+fn armLinkPress(self: *App, button: u32, action: LinkAction) bool {
+    const uri = self.hoveredLinkUri() orelse return false;
+    const cell = self.linkCellAtPointer() orelse return false;
+    const owned = self.alloc.dupe(u8, uri) catch |err| {
+        log.warn("failed to save pressed link: {}", .{err});
+        return false;
+    };
+    if (self.link_press) |old| self.alloc.free(old.uri);
+    self.link_press = .{ .uri = owned, .cell = cell, .button = button, .action = action };
+    return true;
+}
+
+fn cancelLinkPress(self: *App) void {
+    if (self.link_press) |press| self.alloc.free(press.uri);
+    self.link_press = null;
+}
+
+fn finishLinkPress(self: *App, button: u32) bool {
+    const press = self.link_press orelse return false;
+    if (press.button != button) return false;
+    self.link_press = null;
+    defer self.alloc.free(press.uri);
+
+    const cell = self.linkCellAtPointer();
+    const uri = self.hoveredLinkUri();
+    if (cell != null and uri != null and
+        std.meta.eql(cell.?, press.cell) and std.mem.eql(u8, uri.?, press.uri))
+    {
+        switch (press.action) {
+            .open => self.openUri(press.uri),
+            .copy => self.copyLink(press.uri),
+        }
+    }
+    return true;
+}
+
+fn copyLink(self: *App, uri: []const u8) void {
+    const text = clipboard_format.formatLinkCopy(self.alloc, uri) catch |err| {
+        log.warn("failed to format hyperlink for clipboard: {}", .{err});
+        return;
+    };
+    _ = self.clipboard.claim(.clipboard, text, self.last_serial);
+}
+
+fn openUri(self: *App, uri: []const u8) void {
+    const owned = self.alloc.dupe(u8, uri) catch |err| {
+        log.warn("failed to save hyperlink URI: {}", .{err});
+        return;
+    };
+
+    if (self.pending_open_uri) |pending| self.alloc.free(pending);
+    self.pending_open_uri = owned;
+
+    const requested = self.window.requestActivationToken(self.last_serial) catch |err| requested: {
+        log.warn("failed to request hyperlink activation token: {}", .{err});
+        break :requested false;
+    };
+    if (requested) return;
+
+    self.openPendingUri(null);
+}
+
+fn activationTokenReady(ctx: *anyopaque, token: [:0]const u8) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    self.openPendingUri(token);
+}
+
+fn openPendingUri(self: *App, activation_token: ?[:0]const u8) void {
+    const uri = self.pending_open_uri orelse return;
+    self.pending_open_uri = null;
+    defer self.alloc.free(uri);
+
+    self.openUriPortal(uri, activation_token) catch |err| {
+        if (err == error.PortalUnavailable) {
+            self.openUriXdg(uri, activation_token) catch |fallback_err| {
+                log.warn("failed to open hyperlink with xdg-open: {}", .{fallback_err});
+            };
+            return;
+        }
+        log.warn("failed to open hyperlink through portal: {}", .{err});
+    };
+}
+
+fn openUriXdg(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const xdg_open = try resolveCommandPathZ(arena, self.environ, "xdg-open", null);
+
+    const uri_z = try arena.dupeSentinel(u8, uri, 0);
+    const envp = try self.spawnEnvp(arena, null, activation_token);
+    const argv = [_:null]?[*:0]const u8{ "xdg-open", uri_z.ptr };
+    if (!spawnDetached(xdg_open.ptr, &argv, envp, null, "xdg-open")) {
+        return error.SpawnFailed;
+    }
+}
+
+fn pointerPhysical(self: *App) struct { x: f64, y: f64 } {
+    const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
+    return .{
+        .x = @max(0, self.pointer_x * scale),
+        // SelectionGesture supports horizontal padding explicitly; make Y
+        // grid-local so its top/bottom autoscroll thresholds do the same.
+        .y = @max(0, self.pointer_y * scale - @as(f64, @floatFromInt(self.layout.grid_y))),
+    };
+}
+
+fn selectionGeometry(self: *App) vt.SelectionGesture.Drag.Geometry {
+    return .{
+        .columns = self.term.cols,
+        .cell_width = self.font.cell_width,
+        .padding_left = self.layout.grid_x,
+        .screen_height = self.layout.grid_height,
+    };
+}
+
+fn physicalPadding(config: Config, scale120: u32) TerminalLayout.Padding {
+    return .{
+        .left = Window.physicalDimension(config.window_padding_x.first, scale120),
+        .right = Window.physicalDimension(config.window_padding_x.second, scale120),
+        .top = Window.physicalDimension(config.window_padding_y.first, scale120),
+        .bottom = Window.physicalDimension(config.window_padding_y.second, scale120),
+    };
+}
+
+fn selectionTimestamp(ms: u32) std.Io.Timestamp {
+    return std.Io.Timestamp.fromNanoseconds(
+        @as(i96, @intCast(ms)) * @as(i96, @intCast(std.time.ns_per_ms)),
+    );
+}
+
+fn mouseButtonFromEvdev(button: u32) ?vt.input.MouseButton {
+    return switch (button) {
+        272 => .left, // BTN_LEFT
+        273 => .right, // BTN_RIGHT
+        274 => .middle, // BTN_MIDDLE
+        else => null,
+    };
+}
+
+fn reportingMouse(self: *App) bool {
+    return self.term.flags.mouse_event != .none and !self.keyboard.currentMods().shift;
+}
+
+fn forwardMouseButton(self: *App, button: anytype, mouse_button: vt.input.MouseButton) void {
+    // Buttons owned by the application dismiss any terminal-side
+    // selection; the application handles the event its own way.
+    self.clearSelection();
+    if (button.state == .pressed) self.mouse_button = mouse_button;
+    self.sendMouseEvent(.{
+        .action = if (button.state == .pressed) .press else .release,
+        .button = mouse_button,
+        .mods = self.keyboard.currentMods(),
+        .pos = self.pointerPosPhysical(),
+    });
+    if (button.state == .released and self.mouse_button == mouse_button) self.mouse_button = null;
+    self.syncScrollbarHover();
+}
+
+fn startSelection(self: *App, time_ms: u32) void {
+    const pin = self.pinAtPointer() orelse return;
+    const pos = self.pointerPhysical();
+    self.selection_rectangle = self.keyboard.currentMods().ctrl;
+    const selection = self.selection_gesture.press(&self.term, .{
+        .time = selectionTimestamp(time_ms),
+        .pin = pin,
+        .xpos = pos.x,
+        .ypos = pos.y,
+        .max_distance = @floatFromInt(self.font.cell_width),
+        .repeat_interval = selection_repeat_ms * std.time.ns_per_ms,
+        .word_boundary_codepoints = &selection_word_boundaries,
+    }) catch return;
+    self.selecting = true;
+    self.applySelection(selection, true);
+}
+
+fn extendSelection(self: *App) void {
+    const pin = self.pinAtPointer() orelse return;
+    const pos = self.pointerPhysical();
+    const selection = self.selection_gesture.drag(&self.term, .{
+        .pin = pin,
+        .xpos = pos.x,
+        .ypos = pos.y,
+        .rectangle = self.selection_rectangle,
+        .word_boundary_codepoints = &selection_word_boundaries,
+        .geometry = self.selectionGeometry(),
+    });
+    self.applySelection(selection, false);
+    self.syncSelectionAutoscrollTimer();
+}
+
+/// Stop any in-progress drag, untracking the anchor pin on the screen
+/// that owns it (which may no longer be the active one).
+fn cancelDrag(self: *App) void {
+    self.selecting = false;
+    self.selection_rectangle = false;
+    self.selection_gesture.reset(&self.term);
+    self.stopSelectionAutoscrollTimer();
+}
+
+fn finishSelection(self: *App) void {
+    if (!self.selecting) return;
+    self.selecting = false;
+    self.selection_gesture.release(&self.term, .{ .pin = self.pinAtPointer() });
+    self.selection_rectangle = false;
+    self.stopSelectionAutoscrollTimer();
+    // Finished selections claim the primary selection, X style.
+    self.copyToPrimary();
+}
+
+fn applySelection(self: *App, selection: ?vt.Selection, clear_if_null: bool) void {
+    const screen = self.term.screens.active;
+    if (selection) |sel| {
+        screen.select(sel) catch return;
+        self.needs_redraw = true;
+    } else if (clear_if_null and screen.selection != null) {
+        screen.clearSelection();
+        self.needs_redraw = true;
+    }
+}
+
+fn syncSelectionAutoscrollTimer(self: *App) void {
+    if (!self.selecting or self.selection_gesture.left_drag_autoscroll == .none) {
+        self.stopSelectionAutoscrollTimer();
+        return;
+    }
+    const interval = timespecFromNs(selection_autoscroll_ms * std.time.ns_per_ms);
+    _ = setTimer(self.selection_autoscroll_fd, .{
+        .it_value = interval,
+        .it_interval = interval,
+    }, "selection autoscroll");
+}
+
+fn stopSelectionAutoscrollTimer(self: *App) void {
+    _ = setTimer(self.selection_autoscroll_fd, disarmed_timer, "selection autoscroll");
+}
+
+fn fireSelectionAutoscroll(self: *App) void {
+    _ = readTimer(self.selection_autoscroll_fd) orelse return;
+    if (!self.selecting) return;
+
+    self.resetSmoothScroll();
+    const cell = self.cellAtPointer();
+    const pos = self.pointerPhysical();
+    const selection = self.selection_gesture.autoscrollTick(&self.term, .{
+        .viewport = .{ .x = cell.x, .y = cell.y },
+        .xpos = pos.x,
+        .ypos = pos.y,
+        .rectangle = self.selection_rectangle,
+        .word_boundary_codepoints = &selection_word_boundaries,
+        .geometry = self.selectionGeometry(),
+    });
+    self.applySelection(selection, false);
+    self.needs_redraw = true;
+    self.syncHoveredLink(true);
+    self.syncSelectionAutoscrollTimer();
+}
+
+/// Drop the current selection and stop any in-progress drag.
+fn clearSelection(self: *App) void {
+    self.cancelDrag();
+    const screen = self.term.screens.active;
+    if (screen.selection != null) {
+        screen.clearSelection();
+        self.needs_redraw = true;
+    }
+}
+
+/// On alt screen enter/exit, drop any in-flight drag; its anchor pin belongs to the old screen.
+fn syncActiveScreen(self: *App) void {
+    const key = self.term.screens.active_key;
+    if (key == self.active_screen) return;
+    self.active_screen = key;
+    self.scrollbar_reveal_hovered = false;
+    self.scrollbar_hovered = false;
+    self.hideScrollbar();
+    self.cancelDrag();
+    self.syncScrollbarHover();
+}
+
+fn clipboardDevicesChanged(
+    ctx: *anyopaque,
+    data_device: ?*wl.DataDevice,
+    primary_device: ?*zwp.PrimarySelectionDeviceV1,
+) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    self.clipboard.setDevices(data_device, primary_device);
+}
+
+/// The current selection's text, allocated, or null if nothing selected.
+fn selectionText(self: *App) ?[:0]const u8 {
+    const screen = self.term.screens.active;
+    const sel = screen.selection orelse return null;
+    return screen.selectionString(self.alloc, .{ .sel = sel, .trim = true }) catch null;
+}
+
+/// Claim the primary selection with the currently selected text.
+fn copyToPrimary(self: *App) void {
+    const text = self.selectionText() orelse return;
+    _ = self.clipboard.claim(.primary, text, self.last_serial);
+}
+
+/// Claim the clipboard with the currently selected text.
+fn copyToClipboard(self: *App) void {
+    const text = self.selectionText() orelse return;
+    _ = self.clipboard.claim(.clipboard, text, self.last_serial);
+}
+
+/// Ask the offer's owner to stream its contents into a pipe; the read
+/// end joins the poll loop and the paste completes on EOF.
+fn beginPaste(self: *App, target: Clipboard.Target) void {
+    _ = self.clipboard.request(target, .{ .terminal = target });
+}
+
+fn expireClipboardTransfers(self: *App) void {
+    const osc52_kind = self.clipboard.osc52ReadKind();
+    if (!self.clipboard.expireTransfers()) return;
+    if (osc52_kind) |kind| self.writeOsc52ClipboardReport(kind, "");
+    self.failStartedKittyRead(.EIO);
+    self.pumpKittyClipboard();
+}
+
+test "expired Kitty read fails and unblocks the next queued request" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var incoming: [2]posix.fd_t = undefined;
+    var output: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&incoming, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(incoming[1]);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(output[0]);
+    defer _ = linux.close(output[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.clipboard = .init(alloc, null, null);
+    defer app.clipboard.deinit();
+    app.kitty_clipboard = .init(alloc);
+    defer app.kitty_clipboard.deinit();
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+    app.pty.master = output[1];
+    app.clipboard.transfer_fd = incoming[0];
+    app.clipboard.transfer_deadline_ms = 0;
+    try app.kitty_clipboard.handle(.{ .metadata = "type=read:id=first", .payload = "dGV4dC9wbGFpbg==", .terminator = .st });
+    app.kitty_clipboard.front().?.read.started = true;
+    try app.kitty_clipboard.handle(.{ .metadata = "type=read:id=second", .payload = "Lg==", .terminator = .st });
+
+    app.expireClipboardTransfers();
+    try std.testing.expectEqual(@as(posix.fd_t, -1), app.clipboard.transferFd());
+    try std.testing.expect(app.kitty_clipboard.front() == null);
+    try std.testing.expectEqual(@as(usize, 0), app.kitty_clipboard.retained_bytes);
+    var buf: [1024]u8 = undefined;
+    const n = try posix.read(output[0], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "status=EIO") != null);
+    const first = std.mem.indexOf(u8, buf[0..n], "id=first").?;
+    const second = std.mem.indexOf(u8, buf[0..n], "id=second").?;
+    try std.testing.expect(first < second);
+}
+
+fn readClipboardTransfer(self: *App) void {
+    const osc52_kind = self.clipboard.osc52ReadKind();
+    const event = self.clipboard.readTransfer() catch |err| {
+        log.warn("clipboard transfer failed: {}", .{err});
+        if (osc52_kind) |kind| self.writeOsc52ClipboardReport(kind, "");
+        self.failStartedKittyRead(.EIO);
+        self.pumpKittyClipboard();
+        return;
+    } orelse return;
+    defer self.pumpKittyClipboard();
+    defer self.clipboard.finishEvent();
+    switch (event) {
+        .terminal => |paste| self.writeTerminalPaste(
+            .{ .clipboard = clipboardLocation(paste.target) },
+            paste.mime,
+            paste.data,
+        ),
+        .osc52_read => |read| self.writeOsc52ClipboardReport(read.kind, read.data),
+        .kitty_read => |read| {
+            const request = switch (self.kitty_clipboard.front().?.*) {
+                .read => |*request| request,
+                else => unreachable,
+            };
+            std.debug.assert(request.started);
+            var available_buf: [clipboard_format.paste_mime_preference.len][]const u8 = undefined;
+            self.finishKittyClipboardRead(
+                request,
+                self.clipboard.availableMimes(clipboardTargetFromKitty(request.target), &available_buf),
+                .{ .mime = read.mime, .data = read.data },
+            );
+        },
+        .dnd => |drop| {
+            if (self.term.kitty_dnd) |state| {
+                self.writeKittyDndDrop(state, drop);
+                return;
+            }
+            const text = self.formatDropPaste(drop.mime, drop.data) catch return;
+            defer self.alloc.free(text);
+            self.writeTerminalPaste(.text, "text/plain", text);
+        },
+    }
+}
+
+/// Start and retire OSC 5522 operations in FIFO order. Async reads stall the pump until
+/// their pipe hits EOF; writes and metadata-only replies complete immediately.
+fn pumpKittyClipboard(self: *App) void {
+    while (self.kitty_clipboard.front()) |request| switch (request.*) {
+        .status => |*status| {
+            self.writeKittyClipboardStatus(status.op, status.id, status.terminator, status.status);
+            self.kitty_clipboard.pop();
+        },
+        .write => |*write| {
+            self.kitty_clipboard.prepareWrite(write);
+            const target = clipboardTarget(write.committed.loc) orelse {
+                self.writeKittyClipboardStatus(.write, write.committed.id, write.terminator, .ENOSYS);
+                self.kitty_clipboard.pop();
+                continue;
+            };
+            const status: vt.kitty.clipboard.Status = if (write.committed.contents.len == 0)
+                if (self.clipboard.clear(target, self.last_serial)) .DONE else .ENOSYS
+            else status: {
+                const text = for (write.committed.contents) |content| {
+                    if (vt.clipboard.isTextMime(content.mime)) break content;
+                } else break :status .ENOSYS;
+                // Selection sources advertise UTF-8 aliases, so STRING bytes
+                // must cross the Latin-1 boundary before claiming the source.
+                const decoded = if (std.mem.eql(u8, text.mime, "STRING"))
+                    clipboard_format.decodeLatin1(self.alloc, text.data) catch break :status .EIO
+                else
+                    null;
+                defer if (decoded) |data| self.alloc.free(data);
+                const owned = self.alloc.dupeSentinel(u8, decoded orelse text.data, 0) catch break :status .EIO;
+                break :status if (self.clipboard.claim(target, owned, self.last_serial)) .DONE else .ENOSYS;
+            };
+            self.writeKittyClipboardStatus(.write, write.committed.id, write.terminator, status);
+            self.kitty_clipboard.pop();
+        },
+        .read => |*read| {
+            if (read.started) return;
+            self.kitty_clipboard.prepareRead(read) catch {
+                self.writeKittyClipboardStatus(.read, read.id, read.terminator, .EIO);
+                self.kitty_clipboard.pop();
+                continue;
+            };
+            if (read.paste) |paste| {
+                const available = [_][]const u8{paste.mime};
+                self.finishKittyClipboardRead(read, &available, paste);
+                continue;
+            }
+            if (!read.needsTransfer()) {
+                var available_buf: [clipboard_format.paste_mime_preference.len][]const u8 = undefined;
+                self.finishKittyClipboardRead(
+                    read,
+                    self.clipboard.availableMimes(clipboardTargetFromKitty(read.target), &available_buf),
+                    null,
+                );
+                continue;
+            }
+
+            switch (self.clipboard.request(clipboardTargetFromKitty(read.target), .kitty_read)) {
+                .started => {
+                    read.started = true;
+                    return;
+                },
+                .busy => return,
+                .unavailable => {
+                    self.finishKittyClipboardRead(read, &.{}, null);
+                    continue;
+                },
+            }
+        },
+    };
+}
+
+test "Kitty writes decode STRING before claiming UTF-8 selections" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &fds,
+    )));
+    defer _ = linux.close(fds[1]);
+    const display = try wl.Display.connectToFd(fds[0]);
+    defer display.disconnect();
+    const registry = try display.getRegistry();
+    defer registry.destroy();
+    // Real client proxies let the pump claim selections without a compositor.
+    const manager = try registry.bind(1, wl.DataDeviceManager, 3);
+    defer manager.destroy();
+    const device = try registry.bind(2, wl.DataDevice, 3);
+    defer device.release();
+    const primary_manager = try registry.bind(3, zwp.PrimarySelectionDeviceManagerV1, 1);
+    defer primary_manager.destroy();
+    const primary_device = try registry.bind(4, zwp.PrimarySelectionDeviceV1, 1);
+    defer primary_device.destroy();
+
+    var output: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(output[0]);
+    defer _ = linux.close(output[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.clipboard = .init(alloc, manager, primary_manager);
+    defer app.clipboard.deinit();
+    app.clipboard.setDevices(device, primary_device);
+    app.kitty_clipboard = .init(alloc);
+    defer app.kitty_clipboard.deinit();
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+    app.pty.master = output[1];
+    app.last_serial = 17;
+
+    // C3 A9 must remain two Latin-1 characters even though it is valid UTF-8.
+    const latin1 = "caf\xe9 \xa3\xff \xc3\xa9\n";
+    const utf8 = "café £ÿ Ã©\n";
+    const cases = [_]struct { metadata: []const u8, data: []const u8 }{
+        .{ .metadata = "type=wdata:mime=U1RSSU5H", .data = latin1 },
+        .{ .metadata = "type=wdata:mime=VVRGOF9TVFJJTkc=", .data = utf8 },
+    };
+    for ([_]Clipboard.Target{ .clipboard, .primary }) |target| {
+        for (cases) |case| {
+            try app.kitty_clipboard.handle(.{
+                .metadata = if (target == .primary) "type=write:loc=primary" else "type=write",
+                .payload = null,
+                .terminator = .st,
+            });
+            var payload: [128]u8 = undefined;
+            try app.kitty_clipboard.handle(.{
+                .metadata = case.metadata,
+                .payload = std.base64.standard.Encoder.encode(&payload, case.data),
+                .terminator = .st,
+            });
+            try app.kitty_clipboard.handle(.{ .metadata = "type=wdata", .payload = null, .terminator = .st });
+            app.pumpKittyClipboard();
+            try std.testing.expect(app.kitty_clipboard.front() == null);
+            const source = (if (target == .primary) app.clipboard.primary_source else app.clipboard.clip_source).?;
+            try std.testing.expectEqualStrings(utf8, source.text);
+            try std.testing.expectEqualStrings(latin1, source.latin1.?);
+            var reply: [128]u8 = undefined;
+            const n = try posix.read(output[0], &reply);
+            try std.testing.expectEqualStrings("\x1b]5522;type=write:status=DONE\x1b\\", reply[0..n]);
+        }
+    }
+}
+
+fn finishKittyClipboardRead(
+    self: *App,
+    read: *const KittyClipboard.Read,
+    available: []const []const u8,
+    content: ?vt.clipboard.Content,
+) void {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    read.encodeSuccess(self.alloc, &writer.writer, available, content) catch {
+        self.writeKittyClipboardStatus(.read, read.id, read.terminator, .EIO);
+        self.kitty_clipboard.pop();
+        return;
+    };
+    // Multiple text aliases can expand a bounded clipboard into a reply
+    // larger than the PTY backlog. Reject before emitting OK or any DATA.
+    const pending = self.write_queue.items.len - self.write_queue_offset;
+    if (writer.writer.buffered().len > max_pty_write_queue -| pending) {
+        self.writeKittyClipboardStatus(.read, read.id, read.terminator, .EBUSY);
+    } else {
+        self.writePty(writer.writer.buffered());
+    }
+    self.kitty_clipboard.pop();
+}
+
+test "oversized Kitty read replies fail explicitly and retire the request" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.pty.master = fds[1];
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+    app.kitty_clipboard = .init(alloc);
+    defer app.kitty_clipboard.deinit();
+    const data = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(data);
+    @memset(data, 'x');
+    try app.kitty_clipboard.handle(.{
+        .metadata = "type=read:id=large",
+        // Four individually valid text representations exceed the PTY bound.
+        .payload = "dGV4dC9wbGFpbiBVVEY4X1NUUklORyBURVhUIFNUUklORw==",
+        .terminator = .st,
+    });
+    const request = &app.kitty_clipboard.front().?.read;
+    app.finishKittyClipboardRead(request, &.{"text/plain"}, .{ .mime = "text/plain", .data = data });
+    try std.testing.expect(app.kitty_clipboard.front() == null);
+    var reply: [256]u8 = undefined;
+    const n = try posix.read(fds[0], &reply);
+    try std.testing.expectEqualStrings("\x1b]5522;type=read:status=EBUSY:id=large\x1b\\", reply[0..n]);
+    try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
+
+    try app.kitty_clipboard.handle(.{ .metadata = "type=read:id=next", .payload = "dGV4dC9wbGFpbg==", .terminator = .st });
+    app.finishKittyClipboardRead(&app.kitty_clipboard.front().?.read, &.{"text/plain"}, .{ .mime = "text/plain", .data = "ok" });
+    const next_n = try posix.read(fds[0], &reply);
+    try std.testing.expectEqualStrings(
+        "\x1b]5522;type=read:status=OK:id=next\x1b\\" ++
+            "\x1b]5522;type=read:status=DATA:id=next:mime=dGV4dC9wbGFpbg==;b2s=\x1b\\" ++
+            "\x1b]5522;type=read:status=DONE:id=next\x1b\\",
+        reply[0..next_n],
+    );
+    try std.testing.expect(app.kitty_clipboard.front() == null);
+}
+
+fn failStartedKittyRead(self: *App, status: vt.kitty.clipboard.Status) void {
+    const request = self.kitty_clipboard.front() orelse return;
+    const read = switch (request.*) {
+        .read => |*read| read,
+        else => return,
+    };
+    if (!read.started) return;
+    self.writeKittyClipboardStatus(.read, read.id, read.terminator, status);
+    self.kitty_clipboard.pop();
+}
+
+fn writeKittyClipboardStatus(
+    self: *App,
+    op: vt.kitty.clipboard.Operation,
+    id: []const u8,
+    terminator: vt.osc.Terminator,
+    status: vt.kitty.clipboard.Status,
+) void {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    (vt.kitty.clipboard.Response{
+        .op = op,
+        .status = status,
+        .id = id,
+        .terminator = terminator,
+    }).encode(&writer.writer) catch return;
+    self.writePty(writer.writer.buffered());
+}
+
+fn writeTerminalPaste(
+    self: *App,
+    source: vt.PasteSource,
+    mime: []const u8,
+    data: []const u8,
+) void {
+    if (data.len == 0) return;
+
+    switch (source) {
+        .clipboard => |location| if (self.term.modes.get(.kitty_paste_events)) {
+            const target = clipboardTarget(location) orelse return;
+            var writer: std.Io.Writer.Allocating = .init(self.alloc);
+            defer writer.deinit();
+            self.kitty_clipboard.paste(
+                self.io,
+                kittyClipboardTarget(target),
+                mime,
+                data,
+                &writer.writer,
+            ) catch |err| {
+                log.warn("Kitty clipboard paste event failed: {}", .{err});
+                return;
+            };
+            self.writePty(writer.writer.buffered());
+            return;
+        },
+        .text => {},
+    }
+
+    if (!vt.clipboard.isTextMime(mime)) return;
+    // STRING is Latin-1, unlike the other accepted text representations.
+    // Decode only ordinary paste; Kitty transfers retain their MIME and bytes.
+    const decoded = if (std.mem.eql(u8, mime, "STRING"))
+        clipboard_format.decodeLatin1(self.alloc, data) catch return
+    else
+        null;
+    defer if (decoded) |text| self.alloc.free(text);
+    const text = decoded orelse data;
+    // The stream handler emits 4096-byte writes but the PTY queue may reject a later chunk.
+    // Encode the whole paste first so writePty accepts or rejects it atomically.
+    var writer = std.Io.Writer.Allocating.initCapacity(
+        self.alloc,
+        text.len + vt.input.max_paste_frame_size,
+    ) catch |err| {
+        log.warn("terminal paste failed: {}", .{err});
+        return;
+    };
+    defer writer.deinit();
+    // Preserve the existing allow-unsafe policy while retaining libghostty's
+    // bracket framing, control-byte sanitization, and newline conversion.
+    vt.input.encodePasteWriter(&writer.writer, text, .fromTerminal(&self.term)) catch unreachable;
+    self.writePty(writer.written());
+}
+
+test "ordinary STRING pastes and text drops decode Latin-1" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var output: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(output[0]);
+    defer _ = linux.close(output[1]);
+
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer app.term.deinit(alloc);
+    app.stream = .init(.{
+        .allocator = alloc,
+        .handler = .{ .app = app, .terminal_handler = .init(&app.term) },
+    });
+    defer app.stream.deinit();
+    app.stream.handler.terminal_handler.effects = .readonly;
+    app.stream.handler.terminal_handler.effects.write_pty = effectWritePty;
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+    app.pty.master = output[1];
+
+    // C3 A9 is valid UTF-8 too, but STRING still means two Latin-1 characters.
+    const latin1 = "caf\xe9 \xa3\xff \xc3\xa9\n";
+    const utf8 = "café £ÿ Ã©\n";
+    const cases = [_]struct { mime: []const u8, data: []const u8 }{
+        .{ .mime = "STRING", .data = latin1 },
+        .{ .mime = "UTF8_STRING", .data = utf8 },
+    };
+    for (cases) |case| {
+        app.term.modes.set(.bracketed_paste, false);
+        app.writeTerminalPaste(.{ .clipboard = .standard }, case.mime, case.data);
+        var buf: [128]u8 = undefined;
+        const n = try posix.read(output[0], &buf);
+        try std.testing.expectEqualStrings("café £ÿ Ã©\r", buf[0..n]);
+
+        app.term.modes.set(.bracketed_paste, true);
+        app.writeTerminalPaste(.{ .clipboard = .selection }, case.mime, case.data);
+        const bracketed_n = try posix.read(output[0], &buf);
+        try std.testing.expectEqualStrings("\x1b[200~café £ÿ Ã©\n\x1b[201~", buf[0..bracketed_n]);
+
+        const drop = try app.formatDropPaste(case.mime, case.data);
+        defer alloc.free(drop);
+        try std.testing.expectEqualStrings(utf8, drop);
+    }
+}
+
+test "terminal paste is atomic at the PTY backlog limit" {
+    const alloc = std.testing.allocator;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer app.term.deinit(alloc);
+    app.stream = .init(.{
+        .allocator = alloc,
+        .handler = .{ .app = app, .terminal_handler = .init(&app.term) },
+    });
+    defer app.stream.deinit();
+    app.stream.handler.terminal_handler.effects = .readonly;
+    app.stream.handler.terminal_handler.effects.write_pty = effectWritePty;
+    app.write_queue = try .initCapacity(alloc, max_pty_write_queue);
+    defer app.write_queue.deinit(alloc);
+    app.write_queue_offset = 0;
+    app.pty.master = -1; // The existing backlog must keep all input queued.
+
+    // Cross libghostty's streaming boundary and require both sanitization
+    // and newline handling, rather than just checking the output length.
+    const data = try alloc.alloc(u8, 8192);
+    defer alloc.free(data);
+    @memset(data, 'x');
+    data[0] = '\x1b';
+    data[4095] = '\n';
+    data[data.len - 1] = '!';
+    for ([_]bool{ false, true }) |bracketed| {
+        app.term.modes.set(.bracketed_paste, bracketed);
+        const prefix = if (bracketed) "\x1b[200~" else "";
+        const suffix = if (bracketed) "\x1b[201~" else "";
+        const expected = try std.mem.concat(alloc, u8, &.{ prefix, data, suffix });
+        defer alloc.free(expected);
+        expected[prefix.len] = ' ';
+        expected[prefix.len + 4095] = if (bracketed) '\n' else '\r';
+
+        for ([_]i32{ -1, 0, 1 }) |headroom| {
+            const available: usize = @intCast(@as(i32, @intCast(expected.len)) + headroom);
+            const pending = max_pty_write_queue - available;
+            app.write_queue.items.len = pending;
+            @memset(app.write_queue.items, 'q');
+            app.writeTerminalPaste(.{ .clipboard = .standard }, "text/plain", data);
+
+            try std.testing.expectEqual(pending + (if (headroom < 0) @as(usize, 0) else expected.len), app.write_queue.items.len);
+            try std.testing.expect(std.mem.allEqual(u8, app.write_queue.items[0..pending], 'q'));
+            if (headroom >= 0) try std.testing.expectEqualStrings(expected, app.write_queue.items[pending..]);
+        }
+    }
+
+    app.write_queue.items.len = 1;
+    app.write_queue.items[0] = 'q';
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    app.writeTerminalPaste(.text, "text/plain", data);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqualStrings("q", app.write_queue.items);
+}
+
+fn kittyClipboardTarget(target: Clipboard.Target) KittyClipboard.Target {
+    return switch (target) {
+        .clipboard => .clipboard,
+        .primary => .primary,
+    };
+}
+
+fn clipboardTargetFromKitty(target: KittyClipboard.Target) Clipboard.Target {
+    return switch (target) {
+        .clipboard => .clipboard,
+        .primary => .primary,
+    };
+}
+
+fn clipboardLocation(target: Clipboard.Target) vt.clipboard.Location {
+    return switch (target) {
+        .clipboard => .standard,
+        .primary => .primary,
+    };
+}
+
+fn dndEvent(ctx: *anyopaque, event: Clipboard.DndEvent) bool {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    const state = self.term.kitty_dnd orelse return false;
+
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    switch (event) {
+        .motion => |motion| {
+            const mimes = [_][]const u8{motion.mime};
+            state.dragMove(
+                self.alloc,
+                &writer.writer,
+                self.kittyDndMove(motion.x, motion.y, motion.operations),
+                &mimes,
+            ) catch return true;
+        },
+        .leave => state.dragLeave(self.alloc, &writer.writer) catch return true,
+    }
+    self.writePty(writer.writer.buffered());
+    return true;
+}
+
+/// Handle drag-out commands, which libghostty refuses. False means the
+/// command belongs to libghostty.
+fn handleKittyDrag(self: *App, command: vt.osc.Command.KittyDndProtocol) bool {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    const action = self.kitty_drag.handle(&writer.writer, command) catch |err| {
+        log.warn("Kitty drag-out reply failed: {}", .{err});
+        return true;
+    };
+    switch (action) {
+        .forward => return false,
+        .handled => {},
+        .start_drag => self.startKittyDrag(&writer.writer) catch |err| {
+            log.warn("Kitty drag-out reply failed: {}", .{err});
+        },
+        .cancel_drag => self.clipboard.cancelDrag(),
+        .change_image => self.clipboard.showDragIcon(self.kitty_drag.image_index),
+    }
+    self.writePty(writer.writer.buffered());
+    return true;
+}
+
+fn startKittyDrag(self: *App, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    // Only a held press requests an offer, and its release ends the offer.
+    const press = self.drag_press.?;
+    std.debug.assert(press.requested);
+    const icon = self.createDragIcon() catch |err| return self.kitty_drag.dragFailed(writer, switch (err) {
+        error.TooLarge => .EFBIG,
+        error.InvalidImage, error.InvalidData => .EINVAL,
+        error.OutOfMemory => .ENOMEM,
+        else => .EIO,
+    });
+    const operations = self.kitty_drag.operations;
+    self.clipboard.startDrag(
+        self.kitty_drag.offer.?,
+        .{ .copy = operations.copy, .move = operations.move },
+        self.window.surface,
+        icon,
+        press.serial,
+    ) catch |err| return self.kitty_drag.dragFailed(writer, switch (err) {
+        error.Unsupported => .EPERM,
+        error.OutOfMemory => .ENOMEM,
+    });
+    self.clipboard.showDragIcon(self.kitty_drag.image_index);
+    self.drag_press = null;
+    // The native drag takes the pointer grab, so nothing sees this release. Drop the
+    // selection the press started too.
+    if (self.mouse_button) |button| self.sendMouseEvent(.{
+        .action = .release,
+        .button = button,
+        .mods = self.keyboard.currentMods(),
+        .pos = self.pointerPosPhysical(),
+    });
+    self.mouse_button = null;
+    self.clearSelection();
+    try self.kitty_drag.dragStarted(writer);
+}
+
+/// Render the client's drag images; null when it sent none.
+fn createDragIcon(self: *App) !?*DragIcon {
+    const images = self.kitty_drag.images.items;
+    if (images.len == 0) return null;
+    var pixels: std.ArrayList(drag_preview.Pixels) = .empty;
+    defer {
+        for (pixels.items) |rendered| rendered.deinit(self.alloc);
+        pixels.deinit(self.alloc);
+    }
+    try pixels.ensureTotalCapacity(self.alloc, images.len);
+    // Text renders at the window's scale; client pixels map one-to-one to
+    // logical pixels, so they appear the size the client chose.
+    const scale: u31 = if (self.window.compositor.getVersion() >= wl.Surface.set_buffer_scale_since_version)
+        @intCast((self.window.scale120 + 119) / 120)
+    else
+        1;
+    for (images) |image| pixels.appendAssumeCapacity(switch (image.format) {
+        0 => try drag_preview.text(self.alloc, .{
+            .font_family = self.config.font_family,
+            .font_size = self.effectiveFontSize(),
+            .metric_adjustments = self.config.metric_adjustments,
+            .foreground = self.effectiveForeground(),
+            .background = self.term.colors.background.get() orelse .{ .r = 0, .g = 0, .b = 0 },
+        }, image.data.items, image.width, image.height, image.opacity, scale),
+        24 => try drag_preview.fromRgb(self.alloc, image.width, image.height, 3, image.data.items),
+        32 => try drag_preview.fromRgb(self.alloc, image.width, image.height, 4, image.data.items),
+        100 => png: {
+            // The header matched these dimensions; bound the decode by them.
+            if (@as(u64, image.width) * image.height > drag_preview.max_pixels) return error.TooLarge;
+            const decoded = try decodePng(self.alloc, image.data.items);
+            defer self.alloc.free(decoded.data);
+            if (decoded.width != image.width or decoded.height != image.height) return error.InvalidImage;
+            break :png try drag_preview.fromRgb(self.alloc, decoded.width, decoded.height, 4, decoded.data);
+        },
+        else => unreachable,
+    });
+    return try DragIcon.create(self.alloc, self.window.compositor, self.window.shm, pixels.items);
+}
+
+/// Track a left press that may become a drag-out gesture. Shift and Ctrl
+/// keep their selection meanings.
+fn armDragPress(self: *App, serial: u32) void {
+    if (!self.kitty_drag.wantsGesture()) return;
+    const mods = self.keyboard.currentMods();
+    if (mods.shift or mods.ctrl or self.linkCellAtPointer() == null) return;
+    self.drag_press = .{ .serial = serial, .x = self.pointer_x, .y = self.pointer_y };
+}
+
+fn updateDragPress(self: *App) void {
+    const press = if (self.drag_press) |*press| press else return;
+    if (press.requested or !self.kitty_drag.wantsGesture()) return;
+    const dx = self.pointer_x - press.x;
+    const dy = self.pointer_y - press.y;
+    if (dx * dx + dy * dy <= drag_threshold * drag_threshold) return;
+    press.requested = true;
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    self.kitty_drag.requestDrag(&writer.writer, self.kittyDndMove(self.pointer_x, self.pointer_y, .{})) catch return;
+    self.writePty(writer.writer.buffered());
+}
+
+fn endDragPress(self: *App) void {
+    const press = self.drag_press orelse return;
+    self.drag_press = null;
+    if (!press.requested) return;
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    self.kitty_drag.endGesture(&writer.writer) catch return;
+    self.writePty(writer.writer.buffered());
+}
+
+fn dragSourceEvent(ctx: *anyopaque, event: Clipboard.DragEvent) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    const drag = &self.kitty_drag;
+    (switch (event) {
+        .target => |index| drag.targetChanged(&writer.writer, index),
+        .action => |action| drag.actionChanged(&writer.writer, if (action.move) .move else if (action.copy) .copy else .none),
+        .dropped => drag.dropped(&writer.writer),
+        .finished => |end| drag.finished(&writer.writer, end.cancelled),
+        .request => |index| drag.requestData(&writer.writer, index),
+    }) catch return;
+    self.writePty(writer.writer.buffered());
+}
+
+fn writeKittyDndDrop(
+    self: *App,
+    state: *vt.kitty.dnd.State,
+    drop: Clipboard.DndData,
+) void {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    const items = [_]vt.kitty.dnd.Item{.{ .mime = drop.mime, .data = drop.data }};
+    state.dragDrop(
+        self.alloc,
+        &writer.writer,
+        self.kittyDndMove(drop.x, drop.y, drop.operations),
+        &items,
+    ) catch |err| {
+        log.warn("Kitty drag-and-drop failed: {}", .{err});
+        return;
+    };
+    self.writePty(writer.writer.buffered());
+}
+
+fn kittyDndMove(
+    self: *const App,
+    logical_x: f64,
+    logical_y: f64,
+    operations: Clipboard.DndOperations,
+) vt.kitty.dnd.MoveEvent {
+    const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
+    const pixel_x = @max(0, logical_x * scale - @as(f64, @floatFromInt(self.layout.grid_x)));
+    const pixel_y = @max(0, logical_y * scale - @as(f64, @floatFromInt(self.layout.grid_y)));
+    const cell_x: u32 = @intFromFloat(@min(
+        pixel_x / @as(f64, @floatFromInt(self.font.cell_width)),
+        @as(f64, @floatFromInt(self.term.cols -| 1)),
+    ));
+    const cell_y: u32 = @intFromFloat(@min(
+        pixel_y / @as(f64, @floatFromInt(self.font.cell_height)),
+        @as(f64, @floatFromInt(self.term.rows -| 1)),
+    ));
+    return .{
+        .cell_x = cell_x,
+        .cell_y = cell_y,
+        .pixel_x = @intFromFloat(@min(pixel_x, std.math.maxInt(i32))),
+        .pixel_y = @intFromFloat(@min(pixel_y, std.math.maxInt(i32))),
+        .operations = .{ .copy = operations.copy, .move = operations.move },
+    };
+}
+
+fn formatDropPaste(self: *App, mime: []const u8, data: []const u8) ![]u8 {
+    if (std.mem.eql(u8, mime, "STRING")) return clipboard_format.decodeLatin1(self.alloc, data);
+    if (!std.mem.eql(u8, mime, clipboard_format.uri_list_mime)) return self.alloc.dupe(u8, data);
+    return try clipboard_format.formatUriListDrop(self.alloc, data);
+}
+
+fn scrollTarget(self: *const App) ScrollTarget {
+    if (self.term.flags.mouse_event != .none) return .application;
+    return if (self.term.screens.active_key == .alternate) .keys else .viewport;
+}
+
+fn syncScrollTarget(self: *App) void {
+    const target = self.scrollTarget();
+    if (target == self.scroll_target) return;
+    self.scroll_target = target;
+
+    // Remainders and kinetic motion belong to the previous recipient. In
+    // particular, raw precision pixels must not acquire the new scale.
+    self.stopFling();
+    self.stopWheelScroll();
+    self.resetScrollVelocity();
+    self.scroll_pixels = 0;
+    self.scroll_offset = 0;
+    self.scroll_frame_pixels = 0;
+    self.scroll_clicks = 0;
+    self.scroll_value120 = 0;
+    self.scroll_line_remainder = 0;
+    self.scroll_source = .wheel;
+    self.scroll_had_pixels = false;
+    self.scroll_had_discrete = false;
+    self.scroll_had_value120 = false;
+    self.scroll_stop_time_ms = null;
+}
+
+/// Convert accumulated wheel movement into scrolled lines: wheel clicks
+/// count fixed lines, smooth (touchpad) scroll counts cell heights.
+fn finishScrollFrame(self: *App) void {
+    self.syncScrollTarget();
+    if (self.scroll_had_pixels) {
+        if (self.scroll_source == .finger) {
+            self.trackScrollVelocity(self.scroll_frame_pixels, self.scroll_time_ms);
+        } else {
+            self.resetScrollVelocity();
+        }
+    } else if (self.scroll_had_discrete or self.scroll_had_value120) {
+        self.resetScrollVelocity();
+    }
+
+    // Mouse-tracking applications interpret wheel events themselves. Keep
+    // configured scaling for the viewport and alternate-screen key fallback.
+    const discrete_multiplier = if (self.scroll_target == .application)
+        1
+    else
+        self.config.mouse_scroll_multiplier.discrete;
+
+    var lines: i32 = 0;
+    if (self.scroll_had_value120 or self.scroll_had_discrete) {
+        const wheel_ticks = if (self.scroll_had_value120)
+            @as(f64, @floatFromInt(self.scroll_value120)) / 120.0
+        else
+            @as(f64, @floatFromInt(self.scroll_clicks));
+        if (self.config.smooth_scrolling and self.scroll_target == .viewport) {
+            self.queueWheelScroll(wheel_ticks * discrete_multiplier);
+        } else {
+            const total = wheel_ticks * discrete_multiplier + self.scroll_line_remainder;
+            const whole = @trunc(total);
+            lines = @intFromFloat(whole);
+            self.scroll_line_remainder = total - whole;
+            self.resetSmoothScroll();
+        }
+    } else if (self.config.smooth_scrolling and self.scroll_target == .viewport and
+        (self.scroll_pixels != 0 or self.scroll_offset != 0))
+    {
+        self.scrollViewportPixels();
+    } else if (self.scroll_pixels != 0) {
+        // Logical pixels per row: physical cell height descaled.
+        const cell: f64 = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
+            @as(f64, @floatFromInt(self.window.scale120));
+        const multiplier = self.precisionScrollScale();
+        const pixels = self.scroll_pixels * multiplier;
+        const whole = @divTrunc(pixels, cell);
+        lines = @intFromFloat(whole);
+        self.scroll_pixels -= whole * cell / multiplier;
+    }
+    self.scroll_frame_pixels = 0;
+    self.scroll_clicks = 0;
+    self.scroll_value120 = 0;
+    self.scroll_source = .wheel;
+    self.scroll_had_pixels = false;
+    self.scroll_had_discrete = false;
+    self.scroll_had_value120 = false;
+    if (lines != 0) self.scrollLines(lines);
+    if (self.scroll_stop_time_ms) |stop_time| {
+        self.scroll_stop_time_ms = null;
+        // Holding still before lifting must not launch pre-pause momentum.
+        if (self.last_scroll_time_ms) |last| {
+            if (stop_time -% last <= scroll_velocity_timeout_ms) self.startFling();
+        }
+        self.resetScrollVelocity();
+    }
+}
+
+/// Keep the viewport on the first partially visible row, with a nonnegative
+/// remainder. Clamping discards edge overshoot so reversing responds at once.
+fn scrollViewportPixels(self: *App) void {
+    const cell = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
+        @as(f64, @floatFromInt(self.window.scale120));
+    const multiplier = self.precisionScrollScale();
+    const pixels = self.scroll_pixels * multiplier;
+    // Tolerate float drift so eased steps summing to whole rows land on them.
+    const whole = @floor(pixels / cell + 1e-6);
+    const pages = &self.term.screens.active.pages;
+    const before = pages.scrollbar();
+    const target = @as(f64, @floatFromInt(before.offset)) + whole;
+    const max_row = before.total - before.len;
+    pages.scroll(.{ .row = @intFromFloat(std.math.clamp(target, 0, @as(f64, @floatFromInt(max_row)))) });
+    self.scroll_pixels = if (target < 0 or target >= @as(f64, @floatFromInt(max_row)))
+        0
+    else
+        @max(pixels - whole * cell, 0) / multiplier;
+    const old_offset = self.scroll_offset;
+    self.scroll_offset = @intFromFloat(@min(
+        self.scroll_pixels * multiplier * @as(f64, @floatFromInt(self.window.scale120)) / 120.0,
+        @as(f64, @floatFromInt(self.font.cell_height - 1)),
+    ));
+    if (old_offset != self.scroll_offset or before.offset != pages.scrollbar().offset) {
+        if (self.selecting) self.extendSelection();
+        self.revealScrollbar();
+        self.needs_redraw = true;
+        self.syncHoveredLink(true);
+    }
+    if (self.scroll_pixels == 0 and (target < 0 or target >= @as(f64, @floatFromInt(max_row)))) {
+        self.stopFling();
+        self.stopWheelScroll();
+        self.resetScrollVelocity();
+    }
+}
+
+fn resetSmoothScroll(self: *App) void {
+    self.stopWheelScroll();
+    self.scroll_pixels = 0;
+    if (self.scroll_offset != 0) self.needs_redraw = true;
+    self.scroll_offset = 0;
+}
+
+fn precisionScrollScale(self: *const App) f64 {
+    if (self.scrollTarget() == .application) return 1;
+    return wayland_precision_scroll_scale * self.config.mouse_scroll_multiplier.precision;
+}
+
+/// Fold one finger-scroll frame into an exponential moving average in
+/// effective content pixels per second.
+fn trackScrollVelocity(self: *App, pixels: f64, time_ms: u32) void {
+    defer self.last_scroll_time_ms = time_ms;
+    const last = self.last_scroll_time_ms orelse return;
+    const dt_ms: f64 = @floatFromInt(time_ms -% last);
+    if (dt_ms > scroll_velocity_timeout_ms) {
+        self.scroll_velocity = 0;
+        return;
+    }
+    if (dt_ms <= 0) return;
+    const velocity = pixels * self.precisionScrollScale() / dt_ms * 1000.0;
+    self.scroll_velocity = (1 - velocity_smoothing) * self.scroll_velocity + velocity_smoothing * velocity;
+}
+
+fn resetScrollVelocity(self: *App) void {
+    self.scroll_velocity = 0;
+    self.last_scroll_time_ms = null;
+}
+
+fn startFling(self: *App) void {
+    if (!self.config.inertial_scrolling) return;
+    const velocity = std.math.clamp(self.scroll_velocity, -fling_max_velocity, fling_max_velocity);
+    if (@abs(velocity) < fling_start_velocity) return;
+
+    const interval = timespecFromNs(fling_interval_ms * std.time.ns_per_ms);
+    const spec: std.os.linux.itimerspec = .{ .it_value = interval, .it_interval = interval };
+    if (!setTimer(self.fling_fd, spec, "fling")) return;
+    self.fling_velocity = velocity;
+    self.fling_active = true;
+}
+
+fn stopFling(self: *App) void {
+    if (!self.fling_active) return;
+    self.fling_active = false;
+    if (self.wheel_scroll_pixels == 0) _ = setTimer(self.fling_fd, disarmed_timer, "fling");
+}
+
+/// Queue wheel movement in viewport rows for easing onto the viewport. A
+/// reversal drops the unfinished distance so the new direction responds at once.
+fn queueWheelScroll(self: *App, rows: f64) void {
+    std.debug.assert(self.scroll_target == .viewport);
+    const cell = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
+        @as(f64, @floatFromInt(self.window.scale120));
+    const pixels = rows * cell;
+    const armed = self.fling_active or self.wheel_scroll_pixels != 0;
+    if (self.wheel_scroll_pixels * pixels < 0) self.wheel_scroll_pixels = 0;
+    self.wheel_scroll_pixels += pixels;
+    if (armed or self.wheel_scroll_pixels == 0) return;
+    const interval = timespecFromNs(fling_interval_ms * std.time.ns_per_ms);
+    const spec: std.os.linux.itimerspec = .{ .it_value = interval, .it_interval = interval };
+    if (!setTimer(self.fling_fd, spec, "wheel scroll")) self.wheel_scroll_pixels = 0;
+}
+
+fn stopWheelScroll(self: *App) void {
+    if (self.wheel_scroll_pixels == 0) return;
+    self.wheel_scroll_pixels = 0;
+    if (!self.fling_active) _ = setTimer(self.fling_fd, disarmed_timer, "wheel scroll");
+}
+
+/// Move the share of queued wheel distance that an exponential ease covers in
+/// `dt_ms`, finishing once less than half a pixel would remain.
+fn stepWheelScroll(self: *App, dt_ms: f64) void {
+    var step = self.wheel_scroll_pixels * (1 - @exp(-dt_ms / wheel_scroll_time_constant_ms));
+    if (@abs(self.wheel_scroll_pixels - step) < 0.5) step = self.wheel_scroll_pixels;
+    self.wheel_scroll_pixels -= step;
+    if (self.wheel_scroll_pixels == 0 and !self.fling_active) {
+        _ = setTimer(self.fling_fd, disarmed_timer, "wheel scroll");
+    }
+    self.scroll_pixels += step / self.precisionScrollScale();
+    self.finishScrollFrame();
+}
+
+fn fireFling(self: *App) void {
+    self.syncScrollTarget();
+    const expirations = readTimer(self.fling_fd) orelse return;
+    const dt_ms: f64 = @floatFromInt(fling_interval_ms * expirations);
+    if (self.wheel_scroll_pixels != 0) self.stepWheelScroll(dt_ms);
+    if (!self.fling_active) return;
+
+    self.scroll_pixels += self.fling_velocity * dt_ms / 1000.0 / self.precisionScrollScale();
+    self.finishScrollFrame();
+
+    self.fling_velocity *= std.math.pow(f64, fling_decay_per_ms, dt_ms);
+    if (@abs(self.fling_velocity) < fling_min_velocity) self.stopFling();
+}
+
+test "wheel frames route reports, viewport movement, and keys without sharing remainders" {
+    const alloc = std.testing.allocator;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.config = .{};
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 16, .rows = 3, .max_scrollback_bytes = 100_000 });
+    defer app.term.deinit(alloc);
+    var stream = app.term.vtStream();
+    defer stream.deinit();
+    app.write_queue = .empty;
+    defer app.write_queue.deinit(alloc);
+    // A backlog keeps actual encoded PTY input in the queue without a child.
+    try app.write_queue.append(alloc, 0);
+    app.write_queue_offset = 0;
+    app.keyboard.state = null;
+    app.window = try alloc.create(Window);
+    defer alloc.destroy(app.window);
+    app.window.pointer_enter_serial = null;
+    app.window.scale120 = 120;
+    app.window.cursor_shape = .text;
+    app.window.pointer = null;
+    app.font.cell_width = 10;
+    app.font.cell_height = 20;
+    app.layout = .init(160, 60, 10, 20, .{});
+    app.pointer_x = 5;
+    app.pointer_y = 5;
+    app.pointer_inside = false;
+    app.mouse_button = null;
+    app.selecting = false;
+    app.mouse_shape_explicit = false;
+    app.selection_gesture = .init;
+    app.selection_autoscroll_fd = try createTimerFd();
+    defer _ = std.os.linux.close(app.selection_autoscroll_fd);
+    app.scrollbar_fd = try createTimerFd();
+    defer _ = std.os.linux.close(app.scrollbar_fd);
+    app.fling_fd = try createTimerFd();
+    defer _ = std.os.linux.close(app.fling_fd);
+    app.scrollbar_drag = null;
+    app.scrollbar_hovered = false;
+    app.scrollbar_reveal_hovered = false;
+    app.scrollbar_alpha = 0;
+    app.async_generation = 0;
+    app.held_frame = null;
+    app.hovered_link = null;
+    app.link_active = false;
+    app.link_checked_cell = null;
+    app.scroll_offset = 0;
+    app.fling_active = false;
+    app.wheel_scroll_pixels = 0;
+    // Force the same initialization used when a new recipient takes over.
+    app.scroll_target = .application;
+    app.syncScrollTarget();
+
+    for ([_][]const u8{ "\x1b[?9h", "\x1b[?1000h", "\x1b[?1002h", "\x1b[?1003h" }, 0..) |mode, mode_index| {
+        stream.nextSlice(mode);
+        stream.nextSlice("\x1b[?1006h");
+        for ([_]bool{ false, true }) |alternate| {
+            stream.nextSlice(if (alternate) "\x1b[?1049h" else "\x1b[?1049l");
+            for ([_]f64{ 0.01, 0.25, 3, 10_000 }) |multiplier| {
+                app.config.mouse_scroll_multiplier = .{ .discrete = multiplier, .precision = multiplier };
+                for ([_]i32{ -1, 1 }) |sign| {
+                    for (0..3) |form| {
+                        app.write_queue.shrinkRetainingCapacity(1);
+                        switch (form) {
+                            0 => pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = sign } }),
+                            1 => pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = sign * 120 } }),
+                            else => pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(@as(f64, @floatFromInt(sign)) * 20) } }),
+                        }
+                        pointerEvent(app, .frame);
+                        // X10 suppresses wheel buttons; the other modes emit one report.
+                        const expected = if (mode_index == 0) "" else if (sign < 0) "\x1b[<64;1;1M" else "\x1b[<65;1;1M";
+                        try std.testing.expectEqualStrings(expected, app.write_queue.items[1..]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Partial detents and precision pixels truncate toward zero, including reversals.
+    for ([_]i32{ -1, 1 }) |sign| {
+        app.write_queue.shrinkRetainingCapacity(1);
+        for ([_]i32{ 60, -30, 90 }, 0..) |amount, index| {
+            pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = sign * amount } });
+            pointerEvent(app, .frame);
+            if (index < 2) try std.testing.expectEqual(@as(usize, 1), app.write_queue.items.len);
+        }
+        try std.testing.expectEqualStrings(if (sign < 0) "\x1b[<64;1;1M" else "\x1b[<65;1;1M", app.write_queue.items[1..]);
+        app.write_queue.shrinkRetainingCapacity(1);
+        for ([_]f64{ 7, -2, 15 }, 0..) |amount, index| {
+            pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(@as(f64, @floatFromInt(sign)) * amount) } });
+            pointerEvent(app, .frame);
+            if (index < 2) try std.testing.expectEqual(@as(usize, 1), app.write_queue.items.len);
+        }
+        try std.testing.expectEqualStrings(if (sign < 0) "\x1b[<64;1;1M" else "\x1b[<65;1;1M", app.write_queue.items[1..]);
+    }
+
+    // value120 takes precedence over the legacy forms in the same frame.
+    app.write_queue.shrinkRetainingCapacity(1);
+    pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(80) } });
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 2 } });
+    pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = -120 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqualStrings("\x1b[<64;1;1M", app.write_queue.items[1..]);
+    try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
+
+    // Local scrolling moves history instead of writing PTY input. Whole-row
+    // scrolling applies wheel movement at once; eased wheels are tested below.
+    stream.nextSlice("\x1b[?1049l\x1b[?1003l");
+    for (0..30) |_| stream.nextSlice("line\r\n");
+    app.config.smooth_scrolling = false;
+    app.config.mouse_scroll_multiplier = .{ .discrete = 3, .precision = 2 };
+    const offset = app.term.screens.active.pages.scrollbar().offset;
+    app.write_queue.shrinkRetainingCapacity(1);
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(offset - 3, app.term.screens.active.pages.scrollbar().offset);
+    pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = -120 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(offset - 6, app.term.screens.active.pages.scrollbar().offset);
+    pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(-10) } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(offset - 9, app.term.screens.active.pages.scrollbar().offset);
+    try std.testing.expectEqual(@as(usize, 1), app.write_queue.items.len);
+
+    stream.nextSlice("\x1b[?1049h");
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqualStrings("\x1b[A\x1b[A\x1b[A", app.write_queue.items[1..]);
+
+    // A local half-line must not cancel the first opposite application detent.
+    stream.nextSlice("\x1b[?1049l");
+    app.config.mouse_scroll_multiplier.discrete = 0.5;
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(@as(f64, -0.5), app.scroll_line_remainder);
+    stream.nextSlice("\x1b[?1000h");
+    app.write_queue.shrinkRetainingCapacity(1);
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqualStrings("\x1b[<65;1;1M", app.write_queue.items[1..]);
+
+    // The reverse handoff must not lend an application's partial detent to local scrolling.
+    pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = 60 } });
+    pointerEvent(app, .frame);
+    stream.nextSlice("\x1b[?1000l");
+    const before = app.term.screens.active.pages.scrollbar().offset;
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(before, app.term.screens.active.pages.scrollbar().offset);
+    try std.testing.expectEqual(@as(f64, 0.5), app.scroll_line_remainder);
+
+    // A frame without new scroll must not reinterpret pending local pixels as reports or keys.
+    for ([_][]const u8{ "\x1b[?1000h", "\x1b[?1049h" }) |takeover| {
+        stream.nextSlice("\x1b[?1000l\x1b[?1049l");
+        app.config.mouse_scroll_multiplier.precision = 0.01;
+        app.write_queue.shrinkRetainingCapacity(1);
+        pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(100) } });
+        pointerEvent(app, .frame);
+        try std.testing.expectEqual(@as(f64, 100), app.scroll_pixels);
+        stream.nextSlice(takeover);
+        pointerEvent(app, .frame);
+        try std.testing.expectEqualStrings("", app.write_queue.items[1..]);
+        try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
+    }
+
+    stream.nextSlice("\x1b[?1049l\x1b[?1000h");
+    app.syncScrollTarget();
+
+    // Release must use the final motion timestamp, including when both
+    // events share a frame or the Wayland millisecond counter wraps.
+    for ([_]u32{ 100, std.math.maxInt(u32) - 20, std.math.maxInt(u32) - 5 }) |start| {
+        for ([_]u32{ 0, 200, 201, 500 }) |pause| {
+            for ([_]bool{ false, true }) |same_frame| {
+                app.resetScrollVelocity();
+                pointerEvent(app, .{ .axis_source = .{ .axis_source = .finger } });
+                pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = start, .value = .fromDouble(-40) } });
+                pointerEvent(app, .frame);
+                pointerEvent(app, .{ .axis_source = .{ .axis_source = .finger } });
+                pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = start +% 10, .value = .fromDouble(-40) } });
+                if (!same_frame) pointerEvent(app, .frame);
+                pointerEvent(app, .{ .axis_stop = .{ .axis = .vertical_scroll, .time = start +% 10 +% pause } });
+                pointerEvent(app, .frame);
+                try std.testing.expectEqual(pause <= 200, app.fling_active);
+                if (app.fling_active) try std.testing.expectEqual(@as(f64, -3000), app.fling_velocity);
+                try std.testing.expectEqual(@as(f64, 0), app.scroll_velocity);
+                try std.testing.expectEqual(@as(?u32, null), app.last_scroll_time_ms);
+                app.stopFling();
+            }
+        }
+    }
+
+    // Exercise the real timer consumer: one 8 ms tick at 3000 px/s is 24 pixels.
+    for ([_]f64{ 0.01, 1, 10_000 }) |multiplier| {
+        app.config.mouse_scroll_multiplier.precision = multiplier;
+        app.scroll_pixels = 0;
+        app.resetScrollVelocity();
+        app.trackScrollVelocity(40, 100);
+        app.trackScrollVelocity(40, 110);
+        app.startFling();
+        try std.testing.expect(app.fling_active);
+        try std.testing.expectEqual(@as(f64, 3000), app.fling_velocity);
+        // A one-shot timer guarantees one expiration regardless of scheduler delay.
+        try std.testing.expect(setTimer(app.fling_fd, .{ .it_value = timespecFromNs(1), .it_interval = .{ .sec = 0, .nsec = 0 } }, "test fling"));
+        var fds = [_]posix.pollfd{.{ .fd = app.fling_fd, .events = posix.POLL.IN, .revents = 0 }};
+        try std.testing.expectEqual(@as(usize, 1), try posix.poll(&fds, 1000));
+        app.write_queue.shrinkRetainingCapacity(1);
+        app.fireFling();
+        try std.testing.expectEqualStrings("\x1b[<65;1;1M", app.write_queue.items[1..]);
+        try std.testing.expectEqual(@as(f64, 4), app.scroll_pixels);
+        app.stopFling();
+    }
+
+    // Mode changes cancel a running fling before it can deliver to another recipient.
+    app.scroll_velocity = 3000;
+    app.startFling();
+    stream.nextSlice("\x1b[?1000l");
+    app.write_queue.shrinkRetainingCapacity(1);
+    app.fireFling();
+    try std.testing.expect(!app.fling_active);
+    try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
+    try std.testing.expectEqual(@as(f64, 0), app.scroll_velocity);
+    try std.testing.expectEqualStrings("", app.write_queue.items[1..]);
+
+    // Sub-row movement is visible immediately in both directions and at
+    // fractional output scales. Disabling it retains signed quantization.
+    for ([_]u32{ 120, 180 }) |scale| {
+        for ([_]bool{ true, false }) |smooth| {
+            app.config = .{ .smooth_scrolling = smooth, .inertial_scrolling = false };
+            app.window.scale120 = scale;
+            app.resetSmoothScroll();
+            app.term.screens.active.pages.scroll(.{ .row = 5 });
+            const thumb_before = app.currentScrollbarGeometry(scrollbar_default_alpha).?;
+            pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(-1) } });
+            pointerEvent(app, .frame);
+            try std.testing.expectEqual(@as(usize, if (smooth) 4 else 5), app.term.screens.active.pages.scrollbar().offset);
+            const expected: u31 = if (!smooth) 0 else if (scale == 120) 17 else 15;
+            try std.testing.expectEqual(expected, app.scroll_offset);
+            const thumb_after = app.currentScrollbarThumb().?;
+            const moved_rows: f64 = if (!smooth) 0 else if (scale == 120) 0.15 else 0.25;
+            try std.testing.expectApproxEqAbs(
+                moved_rows * @as(f64, @floatFromInt(thumb_before.travel)) /
+                    @as(f64, @floatFromInt(thumb_before.max_offset)),
+                thumb_before.thumb.y - thumb_after.y,
+                0.000001,
+            );
+            if (smooth) {
+                // The exposed bottom strip belongs to the overscan row,
+                // not the viewport's last complete row.
+                app.pointer_y = 59 * 120.0 / @as(f64, @floatFromInt(scale));
+                try std.testing.expectEqual(@as(u16, 3), app.cellAtPointer().y);
+                const pin = app.term.screens.active.pages.pin(.{ .viewport = .{ .y = 3 } }).?;
+                try std.testing.expect(app.pinAtPointer().?.eql(pin));
+            }
+            pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 110, .value = .fromDouble(1) } });
+            pointerEvent(app, .frame);
+            try std.testing.expectEqual(@as(usize, 5), app.term.screens.active.pages.scrollbar().offset);
+            try std.testing.expectEqual(@as(u31, 0), app.scroll_offset);
+            try std.testing.expectEqual(thumb_before.thumb.y, app.currentScrollbarThumb().?.y);
+        }
+    }
+    app.window.scale120 = 120;
+    app.config = .{};
+    for ([_]bool{ false, true }) |bottom| {
+        app.resetSmoothScroll();
+        app.term.screens.active.pages.scroll(if (bottom) .active else .top);
+        const edge = app.term.screens.active.pages.scrollbar().offset;
+        pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(if (bottom) 100 else -100) } });
+        pointerEvent(app, .frame);
+        try std.testing.expectEqual(edge, app.term.screens.active.pages.scrollbar().offset);
+        try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
+        pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 110, .value = .fromDouble(if (bottom) -1 else 1) } });
+        pointerEvent(app, .frame);
+        try std.testing.expectEqual(@as(u31, if (bottom) 17 else 3), app.scroll_offset);
+    }
+    // Explicit row navigation must remove the crop and stale remainder.
+    app.handleScrollbackKey(.{ .key = .home, .action = .press }, .top);
+    try std.testing.expectEqual(@as(u31, 0), app.scroll_offset);
+    try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
+
+    // Inertia uses the same pixel path: 500 px/s for 8 ms moves 4 px.
+    app.term.screens.active.pages.scroll(.{ .row = 5 });
+    app.scroll_velocity = -500;
+    app.startFling();
+    try std.testing.expect(app.fling_active);
+    try std.testing.expect(setTimer(app.fling_fd, .{ .it_value = timespecFromNs(1), .it_interval = .{ .sec = 0, .nsec = 0 } }, "test fling"));
+    var fds = [_]posix.pollfd{.{ .fd = app.fling_fd, .events = posix.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&fds, 1000));
+    app.fireFling();
+    try std.testing.expectEqual(@as(usize, 4), app.term.screens.active.pages.scrollbar().offset);
+    try std.testing.expectEqual(@as(u31, 16), app.scroll_offset);
+    app.stopFling();
+
+    // Detents and hi-res wheel steps ease their full distance through
+    // sub-row positions, then settle row-aligned.
+    for ([_]i32{ -120, 40, -40 }) |value120| {
+        app.resetSmoothScroll();
+        app.term.screens.active.pages.scroll(.{ .row = 10 });
+        pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = value120 } });
+        pointerEvent(app, .frame);
+        try std.testing.expectEqual(@as(usize, 10), app.term.screens.active.pages.scrollbar().offset);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(value120)) / 120 * 3 * 20, app.wheel_scroll_pixels);
+        var ticks: usize = 0;
+        while (app.wheel_scroll_pixels != 0) : (ticks += 1) {
+            try std.testing.expect(ticks < 50);
+            try std.testing.expect(setTimer(app.fling_fd, .{ .it_value = timespecFromNs(1), .it_interval = .{ .sec = 0, .nsec = 0 } }, "test wheel"));
+            var tick_fds = [_]posix.pollfd{.{ .fd = app.fling_fd, .events = posix.POLL.IN, .revents = 0 }};
+            try std.testing.expectEqual(@as(usize, 1), try posix.poll(&tick_fds, 1000));
+            app.fireFling();
+            if (ticks == 0) try std.testing.expect(app.scroll_offset != 0);
+        }
+        try std.testing.expect(ticks > 1);
+        const rows = @divExact(value120 * 3, 120);
+        try std.testing.expectEqual(@as(usize, @intCast(10 + rows)), app.term.screens.active.pages.scrollbar().offset);
+        try std.testing.expectEqual(@as(u31, 0), app.scroll_offset);
+    }
+
+    // Reversal drops the unfinished distance; explicit navigation, edges,
+    // and recipient changes cancel the animation.
+    app.term.screens.active.pages.scroll(.{ .row = 10 });
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -2 } });
+    pointerEvent(app, .frame);
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(@as(f64, 60), app.wheel_scroll_pixels);
+    app.handleScrollbackKey(.{ .key = .home, .action = .press }, .top);
+    try std.testing.expectEqual(@as(f64, 0), app.wheel_scroll_pixels);
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(@as(f64, -60), app.wheel_scroll_pixels);
+    app.stepWheelScroll(fling_interval_ms);
+    try std.testing.expectEqual(@as(f64, 0), app.wheel_scroll_pixels);
+    try std.testing.expectEqual(@as(usize, 0), app.term.screens.active.pages.scrollbar().offset);
+    app.term.screens.active.pages.scroll(.{ .row = 10 });
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 1 } });
+    pointerEvent(app, .frame);
+    stream.nextSlice("\x1b[?1000h");
+    app.write_queue.shrinkRetainingCapacity(1);
+    app.fireFling();
+    try std.testing.expectEqual(@as(f64, 0), app.wheel_scroll_pixels);
+    try std.testing.expectEqualStrings("", app.write_queue.items[1..]);
+}
+
+test "scroll velocity expires across a pause before motion resumes" {
+    const app = try std.testing.allocator.create(App);
+    defer std.testing.allocator.destroy(app);
+    app.config = .{};
+    app.term.flags.mouse_event = .normal;
+    for ([_]u32{ 200, 201, 500 }) |gap| {
+        app.resetScrollVelocity();
+        app.trackScrollVelocity(40, 100);
+        app.trackScrollVelocity(40, 110);
+        try std.testing.expectEqual(@as(f64, 3000), app.scroll_velocity);
+        // A tiny movement after a pause must not make stale speed fresh.
+        app.trackScrollVelocity(0.1, 110 + gap);
+        try std.testing.expectEqual(@as(f64, if (gap == 200) 750.375 else 0), app.scroll_velocity);
+        if (gap > 200) {
+            app.trackScrollVelocity(-4, 120 + gap);
+            try std.testing.expectEqual(@as(f64, -300), app.scroll_velocity);
+        }
+    }
+}
+
+test "application fling threshold ignores precision configuration" {
+    const app = try std.testing.allocator.create(App);
+    defer std.testing.allocator.destroy(app);
+    app.config = .{};
+    app.term.flags.mouse_event = .normal;
+    app.fling_fd = try createTimerFd();
+    defer _ = std.os.linux.close(app.fling_fd);
+    app.wheel_scroll_pixels = 0;
+    for ([_]f64{ 0.01, 1, 10_000 }) |multiplier| {
+        app.config.mouse_scroll_multiplier.precision = multiplier;
+        for ([_]f64{ -4, -1, 1, 4 }) |pixels| {
+            app.fling_active = false;
+            app.resetScrollVelocity();
+            app.trackScrollVelocity(pixels, 100);
+            app.trackScrollVelocity(pixels, 110);
+            app.startFling();
+            try std.testing.expectEqual(pixels * 75, app.scroll_velocity);
+            try std.testing.expectEqual(@abs(pixels) == 4, app.fling_active);
+            app.stopFling();
+        }
+    }
+}
+
+fn scrollbarAtBottom(scrollbar: vt.PageList.Scrollbar) bool {
+    return scrollbar.total <= scrollbar.len or
+        scrollbar.offset >= scrollbar.total - scrollbar.len;
+}
+
+fn scrollbarShouldRender(
+    scrollbar: vt.PageList.Scrollbar,
+    alpha: u8,
+) bool {
+    return alpha > 0 and scrollbar.total > scrollbar.len;
+}
+
+fn scrollbarGeometry(
+    scrollbar: vt.PageList.Scrollbar,
+    row_fraction: f64,
+    layout: TerminalLayout,
+    scale120: u32,
+    alpha: u8,
+) ?ScrollbarGeometry {
+    std.debug.assert(row_fraction >= 0 and row_fraction < 1);
+    if (scrollbar.total <= scrollbar.len or layout.surface_width == 0 or layout.grid_height == 0) return null;
+
+    const inset = @min(Window.physicalDimension(scrollbar_inset, scale120), layout.grid_height / 2);
+    const track_y = layout.grid_y + inset;
+    const track_height = layout.grid_height - inset * 2;
+    if (track_height == 0) return null;
+
+    const desired_width = @max(1, Window.physicalDimension(scrollbar_width, scale120));
+    const right = layout.surface_width -| inset;
+    if (right == 0) return null;
+    const width = @min(desired_width, right);
+    const min_height = @min(track_height, @max(1, Window.physicalDimension(scrollbar_min_thumb, scale120)));
+    const proportional: u31 = @intCast(
+        (@as(u128, track_height) * scrollbar.len) / scrollbar.total,
+    );
+    const thumb_height = @min(track_height, @max(min_height, @max(1, proportional)));
+    const travel = track_height - thumb_height;
+    const max_offset = scrollbar.total - scrollbar.len;
+    const offset = @min(
+        @as(f64, @floatFromInt(scrollbar.offset)) + row_fraction,
+        @as(f64, @floatFromInt(max_offset)),
+    );
+    const thumb_offset = @as(f64, @floatFromInt(travel)) * offset /
+        @as(f64, @floatFromInt(max_offset));
+
+    return .{
+        .thumb = .{
+            .x = right - width,
+            .y = @as(f64, @floatFromInt(track_y)) + thumb_offset,
+            .width = width,
+            .height = thumb_height,
+            .alpha = alpha,
+        },
+        .track_y = track_y,
+        .travel = travel,
+        .max_offset = max_offset,
+    };
+}
+
+fn scrollbarRowForThumbY(geometry: ScrollbarGeometry, thumb_y: f64) usize {
+    if (geometry.travel == 0) return 0;
+    const relative = std.math.clamp(
+        thumb_y - @as(f64, @floatFromInt(geometry.track_y)),
+        0,
+        @as(f64, @floatFromInt(geometry.travel)),
+    );
+    return @intFromFloat(@round(
+        relative / @as(f64, @floatFromInt(geometry.travel)) *
+            @as(f64, @floatFromInt(geometry.max_offset)),
+    ));
+}
+
+fn currentScrollbarGeometry(self: *App, alpha: u8) ?ScrollbarGeometry {
+    return scrollbarGeometry(
+        self.term.screens.active.pages.scrollbar(),
+        // Match the physical pixel crop used to render the text, while
+        // retaining subpixel precision on the much shorter scrollbar track.
+        @as(f64, @floatFromInt(self.scroll_offset)) / @as(f64, @floatFromInt(self.font.cell_height)),
+        self.layout,
+        self.window.scale120,
+        alpha,
+    );
+}
+
+fn currentScrollbarThumb(self: *App) ?Renderer.ScrollbarThumb {
+    const scrollbar = self.term.screens.active.pages.scrollbar();
+    if (!scrollbarShouldRender(scrollbar, self.scrollbar_alpha)) return null;
+    const geometry = self.currentScrollbarGeometry(self.scrollbar_alpha) orelse return null;
+    return geometry.thumb;
+}
+
+fn cubicBezierCoordinate(t: f64, control_1: f64, control_2: f64) f64 {
+    const inverse = 1.0 - t;
+    return 3.0 * inverse * inverse * t * control_1 +
+        3.0 * inverse * t * t * control_2 + t * t * t;
+}
+
+/// Evaluate Fluent's curveAccelerateMin cubic-bezier(0.8, 0, 0.78, 1) at timeline position `x`.
+fn scrollbarFadeProgress(x: f64) f64 {
+    std.debug.assert(x >= 0.0 and x <= 1.0);
+    if (x == 0.0 or x == 1.0) return x;
+
+    // CSS timing curves map x to y through the Bezier parameter. A short
+    // bisection is deterministic and more than precise enough for u8 alpha.
+    var low: f64 = 0.0;
+    var high: f64 = 1.0;
+    for (0..16) |_| {
+        const t = (low + high) / 2.0;
+        if (cubicBezierCoordinate(t, 0.8, 0.78) < x)
+            low = t
+        else
+            high = t;
+    }
+    return cubicBezierCoordinate((low + high) / 2.0, 0.0, 1.0);
+}
+
+fn scrollbarFadeAlpha(elapsed_ms: u16) u8 {
+    if (elapsed_ms >= scrollbar_fade_duration_ms) return 0;
+    const progress = @as(f64, @floatFromInt(elapsed_ms)) / scrollbar_fade_duration_ms;
+    const initial_alpha: f64 = @floatFromInt(scrollbar_default_alpha);
+    return @intFromFloat(@round(initial_alpha * (1.0 - scrollbarFadeProgress(progress))));
+}
+
+test "scrollbar fade follows Fluent accelerated exit curve" {
+    try std.testing.expectEqual(@as(u8, scrollbar_default_alpha), scrollbarFadeAlpha(0));
+    try std.testing.expectEqual(@as(u8, 0), scrollbarFadeAlpha(scrollbar_fade_duration_ms));
+    try std.testing.expect(scrollbarFadeAlpha(scrollbar_fade_duration_ms / 2) > scrollbar_default_alpha / 2);
+
+    var previous: u8 = scrollbar_default_alpha;
+    var elapsed: u16 = scrollbar_fade_interval_ms;
+    while (elapsed <= scrollbar_fade_duration_ms) : (elapsed += scrollbar_fade_interval_ms) {
+        const alpha = scrollbarFadeAlpha(elapsed);
+        try std.testing.expect(alpha <= previous);
+        previous = alpha;
+    }
+}
+
+fn armScrollbarHold(self: *App) void {
+    self.scrollbar_fading = false;
+    self.scrollbar_fade_elapsed_ms = 0;
+    _ = setTimer(self.scrollbar_fd, .{
+        .it_value = timespecFromNs(scrollbar_hold_ms * std.time.ns_per_ms),
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    }, "scrollbar");
+}
+
+fn hideScrollbar(self: *App) void {
+    _ = setTimer(self.scrollbar_fd, disarmed_timer, "scrollbar");
+    self.scrollbar_fading = false;
+    self.scrollbar_fade_elapsed_ms = 0;
+    if (self.scrollbar_alpha == 0) return;
+    self.scrollbar_alpha = 0;
+    self.requestFullAsyncRedraw();
+}
+
+fn revealScrollbar(self: *App) void {
+    const scrollbar = self.term.screens.active.pages.scrollbar();
+    const at_bottom = scrollbarAtBottom(scrollbar);
+    self.scrollbar_fading = false;
+    self.scrollbar_fade_elapsed_ms = 0;
+
+    const alpha: u8 = if (self.scrollbar_drag != null or self.scrollbar_hovered)
+        scrollbar_hover_alpha
+    else
+        scrollbar_default_alpha;
+    const changed = self.scrollbar_alpha != alpha;
+    self.scrollbar_alpha = alpha;
+    if (self.scrollbar_drag == null and !self.scrollbar_hovered and
+        (!self.scrollbar_reveal_hovered or at_bottom))
+        self.armScrollbarHold()
+    else
+        _ = setTimer(self.scrollbar_fd, disarmed_timer, "scrollbar");
+    if (changed) self.requestFullAsyncRedraw();
+}
+
+fn fireScrollbarFade(self: *App) void {
+    const expirations = readTimer(self.scrollbar_fd) orelse return;
+    const at_bottom = scrollbarAtBottom(self.term.screens.active.pages.scrollbar());
+    if (self.scrollbar_drag != null or self.scrollbar_hovered or self.scrollbar_alpha == 0 or
+        (self.scrollbar_reveal_hovered and !at_bottom)) return;
+
+    if (self.reduced_motion) {
+        self.hideScrollbar();
+        self.syncHoveredLink(true);
+        return;
+    }
+
+    if (!self.scrollbar_fading) {
+        self.scrollbar_fading = true;
+        self.scrollbar_fade_elapsed_ms = 0;
+        const interval = timespecFromNs(scrollbar_fade_interval_ms * std.time.ns_per_ms);
+        _ = setTimer(self.scrollbar_fd, .{ .it_value = interval, .it_interval = interval }, "scrollbar");
+        return;
+    }
+
+    const max_ticks = scrollbar_fade_duration_ms / scrollbar_fade_interval_ms;
+    const ticks: u16 = @intCast(@min(expirations, max_ticks));
+    self.scrollbar_fade_elapsed_ms = @min(
+        scrollbar_fade_duration_ms,
+        self.scrollbar_fade_elapsed_ms + ticks * scrollbar_fade_interval_ms,
+    );
+    const alpha = scrollbarFadeAlpha(self.scrollbar_fade_elapsed_ms);
+    if (alpha == 0) {
+        self.hideScrollbar();
+        self.syncHoveredLink(true);
+    } else if (alpha != self.scrollbar_alpha) {
+        self.scrollbar_alpha = alpha;
+        self.requestFullAsyncRedraw();
+    }
+}
+
+/// Route wheel scrolling (positive = newer): mouse reports if requested, arrow keys on
+/// the alt screen, else the scrollback viewport.
+fn scrollLines(self: *App, lines_down: i32) void {
+    const lines_abs: u32 = @abs(lines_down);
+    const target = self.scrollTarget();
+    if (target == .application) {
+        // A selection can exist here via the shift override; scrolling
+        // hands control back to the application, so drop it.
+        self.clearSelection();
+        const button: vt.input.MouseButton = if (lines_down < 0) .four else .five;
+        for (0..lines_abs) |_| {
+            self.sendMouseEvent(.{
+                .action = .press,
+                .button = button,
+                .mods = self.keyboard.currentMods(),
+                .pos = self.pointerPosPhysical(),
+            });
+        }
+        return;
+    }
+
+    if (target == .keys) {
+        // Full-screen apps without mouse support expect cursor keys; they move content, so
+        // any selection over it goes stale.
+        self.clearSelection();
+        const key: vt.input.Key = if (lines_down < 0) .arrow_up else .arrow_down;
+        for (0..lines_abs) |_| _ = self.encodeAndWriteKey(.{ .key = key, .action = .press });
+        return;
+    }
+
+    self.term.screens.active.pages.scroll(.{ .delta_row = lines_down });
+    if (self.selecting) self.extendSelection();
+    self.revealScrollbar();
+    self.needs_redraw = true;
+    self.syncHoveredLink(true);
+}
+
+fn sendMouseEvent(self: *App, event: vt.input.MouseEncodeEvent) void {
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    var opts = vt.input.MouseEncodeOptions.fromTerminal(&self.term, .{
+        .screen = .{
+            .width = self.layout.surface_width,
+            .height = self.layout.surface_height,
+        },
+        .cell = .{ .width = self.font.cell_width, .height = self.font.cell_height },
+        .padding = .{
+            .top = self.layout.padding.top,
+            .right = self.layout.padding.right,
+            .bottom = self.layout.padding.bottom,
+            .left = self.layout.padding.left,
+        },
+    });
+    opts.any_button_pressed = event.action == .press or self.mouse_button != null;
+    vt.input.encodeMouse(&writer, event, opts) catch return;
+    self.writePty(writer.buffered());
+}
+
+/// Pointer position in physical (buffer) pixels, as mouse encoding expects.
+fn pointerPosPhysical(self: *App) vt.input.MouseEncodeEvent.Pos {
+    const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
+    return .{
+        .x = @floatCast(self.pointer_x * scale),
+        .y = @floatCast(self.pointer_y * scale),
+    };
+}
+
+/// Window keyboard delegate: track xkb state and encode key presses into PTY input.
+fn keyboardEvent(ctx: *anyopaque, maybe_event: ?wl.Keyboard.Event) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    const event = maybe_event orelse {
+        self.loseKeyboardFocus();
+        return;
+    };
+    switch (event) {
+        .keymap => |keymap| {
+            if (keymap.format != .xkb_v1) {
+                log.err("unsupported keymap format {}", .{keymap.format});
+                _ = std.os.linux.close(keymap.fd);
+                return;
+            }
+            // A new keymap redefines what the armed repeat keycode means, so stop it.
+            self.cancelRepeat();
+            // setKeymap takes ownership of the fd.
+            self.keyboard.setKeymap(keymap.fd, keymap.size) catch |err| {
+                log.err("keymap load failed: {}", .{err});
+            };
+        },
+        .modifiers => |mods| {
+            const links_were_active = self.linksActive();
+            self.keyboard.updateMods(
+                mods.mods_depressed,
+                mods.mods_latched,
+                mods.mods_locked,
+                mods.group,
+            );
+            if (links_were_active != self.linksActive()) {
+                self.syncHoveredLink(true);
+            }
+        },
+        .key => |key| {
+            self.last_serial = key.serial;
+            const action: vt.input.KeyAction = switch (key.state) {
+                .pressed => .press,
+                .released => .release,
+                .repeated => .repeat,
+                else => return,
+            };
+            self.onKey(key.key, action);
+            switch (action) {
+                .press => if (self.keyboard.keyRepeats(key.key)) self.armRepeat(key.key),
+                .release => if (self.repeat_keycode == key.key) self.cancelRepeat(),
+                else => {},
+            }
+        },
+        .repeat_info => |info| {
+            self.repeat_rate = info.rate;
+            self.repeat_delay = info.delay;
+            if (self.repeat_keycode) |keycode| {
+                if (repeatTimerSpec(info.rate, info.delay)) |_|
+                    self.armRepeat(keycode)
+                else
+                    self.cancelRepeat();
+            }
+        },
+        // Keys held across a focus change must not keep repeating.
+        .leave => self.loseKeyboardFocus(),
+        .enter => |enter| {
+            self.last_serial = enter.serial;
+            self.setFocus(true);
+        },
+    }
+}
+
+fn loseKeyboardFocus(self: *App) void {
+    self.cancelRepeat();
+    self.keyboard.resetTransientState();
+    self.setFocus(false);
+}
+
+test "keyboard removal cancels repeat and reports focus loss once" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.keyboard = try .init();
+    defer app.keyboard.deinit();
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer app.term.deinit(alloc);
+    app.term.modes.set(.focus_event, true);
+    app.focused = true;
+    app.async_generation = 0;
+    app.held_frame = null;
+    app.repeat_fd = try createTimerFd();
+    defer _ = linux.close(app.repeat_fd);
+    app.repeat_rate = 25;
+    app.repeat_delay = 500;
+    app.armRepeat(30);
+    var timer: linux.itimerspec = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.timerfd_gettime(app.repeat_fd, &timer)));
+    try std.testing.expect(timer.it_interval.nsec > 0);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    app.pty.master = fds[1];
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+
+    keyboardEvent(app, null);
+    keyboardEvent(app, null);
+    try std.testing.expectEqual(null, app.repeat_keycode);
+    try std.testing.expect(!app.focused);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.timerfd_gettime(app.repeat_fd, &timer)));
+    try std.testing.expectEqualDeep(disarmed_timer, timer);
+    var buf: [64]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings("\x1b[O", buf[0..n]);
+}
+
+fn setFocus(self: *App, focused: bool) void {
+    if (self.focused == focused) return;
+    self.focused = focused;
+    self.requestFullAsyncRedraw();
+    // Applications with focus reporting (mode 1004) get CSI I / CSI O.
+    if (self.term.modes.get(.focus_event)) {
+        var buf: [vt.input.max_focus_encode_size]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        vt.input.encodeFocus(&writer, if (focused) .gained else .lost) catch return;
+        self.writePty(writer.buffered());
+    }
+}
+
+/// Wayland's suspended toplevel state is positive knowledge that the view is
+/// hidden. Every other state remains conservatively potentially visible.
+fn syncTerminalVisibility(self: *App) void {
+    const visible = !self.window.suspended;
+    if (self.term.flags.visible == visible) return;
+    self.term.flags.visible = visible;
+    if (!self.term.modes.get(.report_visibility)) return;
+
+    var buf: [vt.device_status.max_visibility_report_encode_size]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    vt.device_status.encodeVisibilityReport(
+        &writer,
+        if (visible) .potentially_visible else .not_visible,
+    ) catch return;
+    self.writePty(writer.buffered());
+}
+
+fn textInputEvent(ctx: *anyopaque, event: zwp.TextInputV3.Event) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .enter => {
+            self.ime_focused = true;
+            self.window.enableTextInput(self.textInputCursorRect(self.currentCursorState()));
+        },
+        .leave => {
+            self.ime_focused = false;
+            self.window.disableTextInput();
+            self.setImePreedit(null);
+            self.resetPendingIme();
+        },
+        .preedit_string => |preedit| {
+            self.replaceImeText(&self.ime_pending_preedit, if (preedit.text) |text| std.mem.sliceTo(text, 0) else null);
+        },
+        .commit_string => |commit| {
+            self.replaceImeText(&self.ime_pending_commit, if (commit.text) |text| std.mem.sliceTo(text, 0) else null);
+        },
+        .delete_surrounding_text => {},
+        .done => {
+            self.applyPendingIme();
+        },
+    }
+}
+
+fn applyPendingIme(self: *App) void {
+    if (self.ime_pending_commit) |commit| {
+        if (commit.len > 0) {
+            self.writePty(commit);
+            self.stopFling();
+            self.resetSmoothScroll();
+            self.clearSelection();
+            if (self.term.screens.active.pages.viewport != .active) {
+                self.term.screens.active.pages.scroll(.active);
+                self.revealScrollbar();
+                self.syncHoveredLink(true);
+            }
+        }
+    }
+    self.setImePreedit(self.ime_pending_preedit);
+    self.resetPendingIme();
+    self.syncTextInputCursorRect(&self.render_state);
+}
+
+fn setImePreedit(self: *App, text: ?[]const u8) void {
+    self.replaceImeText(&self.ime_preedit, text);
+    self.requestFullAsyncRedraw();
+}
+
+fn replaceImeText(self: *App, slot: *?[]u8, text: ?[]const u8) void {
+    if (slot.*) |old| self.alloc.free(old);
+    slot.* = null;
+    const value = text orelse return;
+    if (value.len == 0) return;
+    slot.* = self.alloc.dupe(u8, value) catch |err| {
+        log.warn("failed to copy IME text: {}", .{err});
+        return;
+    };
+}
+
+fn resetPendingIme(self: *App) void {
+    self.replaceImeText(&self.ime_pending_preedit, null);
+    self.replaceImeText(&self.ime_pending_commit, null);
+}
+
+fn clearImeText(self: *App) void {
+    self.replaceImeText(&self.ime_preedit, null);
+    self.resetPendingIme();
+}
+
+/// Start (or move) key repeat to the given key: first fire after the
+/// configured delay, then at the configured rate.
+fn armRepeat(self: *App, evdev_keycode: u32) void {
+    const spec = repeatTimerSpec(self.repeat_rate, self.repeat_delay) orelse return;
+    self.repeat_keycode = evdev_keycode;
+    _ = setTimer(self.repeat_fd, spec, "key repeat");
+}
+
+fn cancelRepeat(self: *App) void {
+    self.repeat_keycode = null;
+    _ = setTimer(self.repeat_fd, disarmed_timer, "key repeat");
+}
+
+fn repeatTimerSpec(rate: i32, delay_ms: i32) ?std.os.linux.itimerspec {
+    if (rate <= 0 or delay_ms < 0) return null;
+    const interval_ns = @max(
+        1,
+        @divTrunc(std.time.ns_per_s, @as(u64, @intCast(rate))),
+    );
+    // A zero timerfd value disarms the timer, so represent Wayland's legal
+    // zero-millisecond delay with the shortest possible initial interval.
+    const delay_ns = @max(1, @as(u64, @intCast(delay_ms)) * std.time.ns_per_ms);
+    return .{
+        .it_value = timespecFromNs(delay_ns),
+        .it_interval = timespecFromNs(interval_ns),
+    };
+}
+
+test "key repeat timer accepts zero delay and disables zero rate" {
+    const immediate = repeatTimerSpec(25, 0).?;
+    try std.testing.expectEqual(@as(isize, 0), immediate.it_value.sec);
+    try std.testing.expectEqual(@as(isize, 1), immediate.it_value.nsec);
+    try std.testing.expectEqual(@as(isize, 40 * std.time.ns_per_ms), immediate.it_interval.nsec);
+
+    try std.testing.expectEqual(null, repeatTimerSpec(0, 500));
+    try std.testing.expectEqual(null, repeatTimerSpec(25, -1));
+}
+
+fn createTimerFd() !posix.fd_t {
+    const rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.TimerFdFailed;
+    return @intCast(rc);
+}
+
+fn setTimer(fd: posix.fd_t, spec: std.os.linux.itimerspec, label: []const u8) bool {
+    const rc = std.os.linux.timerfd_settime(fd, .{}, &spec, null);
+    const err = std.os.linux.errno(rc);
+    if (err == .SUCCESS) return true;
+    log.err("{s} timerfd_settime failed: {}", .{ label, err });
+    return false;
+}
+
+fn readTimer(fd: posix.fd_t) ?u64 {
+    var expirations: u64 = 0;
+    const n = posix.read(fd, std.mem.asBytes(&expirations)) catch return null;
+    return if (n == @sizeOf(u64) and expirations > 0) expirations else null;
+}
+
+fn timespecFromNs(ns: u64) std.os.linux.timespec {
+    return .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+}
+
+/// The repeat timer expired: re-send the held key.
+fn fireRepeat(self: *App) void {
+    const expirations = readTimer(self.repeat_fd) orelse return;
+    const keycode = self.repeat_keycode orelse return;
+    // Cap the burst so a stalled loop can't flood the PTY.
+    for (0..@min(expirations, 8)) |_| self.onKey(keycode, .repeat);
+}
+
+fn fireKittyAnimation(self: *App) void {
+    _ = readTimer(self.kitty_animation_fd) orelse return;
+    self.needs_redraw = true;
+}
+
+fn syncScrollbackCompression(self: *App) void {
+    const activity = self.term.compressionActivity();
+    if (activity == self.compression_activity) return;
+    self.compression_activity = activity;
+    self.armScrollbackCompression(compression_idle_ms);
+}
+
+fn fireScrollbackCompression(self: *App) void {
+    _ = readTimer(self.compression_fd) orelse return;
+
+    const activity = self.term.compressionActivity();
+    if (activity != self.compression_activity) {
+        self.compression_activity = activity;
+        self.armScrollbackCompression(compression_idle_ms);
+        return;
+    }
+
+    if (self.term.compress(.incremental) == .pending) {
+        self.armScrollbackCompression(compression_step_ms);
+    }
+}
+
+fn armScrollbackCompression(self: *App, delay_ms: u64) void {
+    _ = setTimer(self.compression_fd, .{
+        .it_value = timespecFromNs(delay_ms * std.time.ns_per_ms),
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    }, "scrollback compression");
+}
+
+const KeyBindingAction = union(enum) {
+    lines: isize,
+    page_up,
+    page_down,
+    top,
+    bottom,
+    passthrough,
+};
+
+fn keyBindingAction(
+    config: *const Config,
+    active_screen: vt.ScreenSet.Key,
+    event: vt.input.KeyEvent,
+) ?KeyBindingAction {
+    if (keybind.getEvent(config.keybinds.items, event)) |action| {
+        // Explicit bindings override fixed shortcuts even when unbound or
+        // passed through to an alternate-screen application.
+        return switch (action) {
+            .unbind => .passthrough,
+            .scroll_page_lines => |lines| if (active_screen == .primary) .{ .lines = lines } else .passthrough,
+        };
+    }
+    // Leave scrollback shortcuts to full-screen applications.
+    if (active_screen != .primary) return null;
+    if (!event.mods.shift or event.mods.ctrl or event.mods.alt or event.mods.super) return null;
+
+    return switch (event.key) {
+        .page_up => .page_up,
+        .page_down => .page_down,
+        .home => .top,
+        .end => .bottom,
+        else => null,
+    };
+}
+
+fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent, scroll: KeyBindingAction) void {
+    std.debug.assert(scroll != .passthrough);
+    // Consume the matching release too, but move only on press/repeat.
+    if (event.action == .release) return;
+
+    self.stopFling();
+    self.resetSmoothScroll();
+    const rows: isize = @intCast(self.term.rows);
+    switch (scroll) {
+        .lines => |lines| self.term.screens.active.pages.scroll(.{ .delta_row = lines }),
+        .page_up => self.term.screens.active.pages.scroll(.{ .delta_row = -rows }),
+        .page_down => self.term.screens.active.pages.scroll(.{ .delta_row = rows }),
+        .top => self.term.screens.active.pages.scroll(.top),
+        .bottom => self.term.screens.active.pages.scroll(.active),
+        .passthrough => unreachable,
+    }
+    self.revealScrollbar();
+    self.needs_redraw = true;
+    self.syncHoveredLink(true);
+}
+
+fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
+    var utf8_buf: [16]u8 = undefined;
+    const event = self.keyboard.translate(&utf8_buf, evdev_keycode, action) orelse return;
+
+    if (keyBindingAction(&self.config, self.term.screens.active_key, event)) |bound| switch (bound) {
+        .passthrough => {},
+        else => return self.handleScrollbackKey(event, bound),
+    } else if (!event.mods.alt and !event.mods.super) {
+        // Fixed shortcuts fire once; their repeats and releases must not reach the app.
+        // Shift is only allowed on `=` (Ctrl++); ctrl+_ and ctrl+) belong to the app.
+        if (event.mods.ctrl) {
+            switch (event.unshifted_codepoint) {
+                '=' => return if (action == .press) self.adjustRuntimeFontSize(1),
+                '-' => if (!event.mods.shift) return if (action == .press) self.adjustRuntimeFontSize(-1),
+                '0' => if (!event.mods.shift) return if (action == .press) self.resetRuntimeFontSize(),
+                else => {},
+            }
+        }
+
+        // Copy/paste bindings take priority over the application.
+        if (event.mods.ctrl and event.mods.shift) {
+            switch (event.unshifted_codepoint) {
+                'c' => return if (action == .press) self.copyToClipboard(),
+                'g' => return if (action == .press) self.pipeCommandOutput(),
+                'v' => return if (action == .press) self.beginPaste(.clipboard),
+                'x' => return if (action == .press) self.jumpPrompt(1),
+                'z' => return if (action == .press) self.jumpPrompt(-1),
+                ',' => return if (action == .press) self.reloadConfig(),
+                else => {},
+            }
+        }
+    }
+
+    const wrote = self.encodeAndWriteKey(event);
+
+    // A non-modifier key that produced input clears the selection and snaps the viewport
+    // to the bottom (ghostty's selection-clear-on-typing).
+    if (wrote and action != .release and !event.key.modifier()) {
+        self.stopFling();
+        self.resetSmoothScroll();
+        self.clearSelection();
+        if (self.term.screens.active.pages.viewport != .active) {
+            self.term.screens.active.pages.scroll(.active);
+            self.revealScrollbar();
+            self.needs_redraw = true;
+            self.syncHoveredLink(true);
+        }
+    }
+}
+
+test "fixed shortcuts consume repeats and releases only with matching modifiers" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.config = .{};
+    defer app.config.keybinds.deinit(alloc);
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer app.term.deinit(alloc);
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+    app.pty.master = fds[1];
+    app.fling_active = false;
+    app.scroll_offset = 0;
+    app.wheel_scroll_pixels = 0;
+    app.selection_gesture = .init;
+    app.selection_autoscroll_fd = try createTimerFd();
+    defer _ = linux.close(app.selection_autoscroll_fd);
+    app.keyboard = try .init();
+    defer app.keyboard.deinit();
+
+    const names: c.xkb_rule_names = .{ .layout = "us", .options = "" };
+    const keymap = c.xkb_keymap_new_from_names(app.keyboard.context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse
+        return error.KeymapParseFailed;
+    defer c.xkb_keymap_unref(keymap);
+    const keymap_text = c.xkb_keymap_get_as_string(keymap, c.XKB_KEYMAP_FORMAT_TEXT_V1) orelse
+        return error.KeymapParseFailed;
+    defer std.c.free(keymap_text);
+    const keymap_size = std.mem.len(keymap_text) + 1;
+    const keymap_fd = try posix.memfd_createZ("shortcut-test", linux.MFD.CLOEXEC);
+    // setKeymap takes ownership of this fd, including on failure.
+    try std.testing.expectEqual(keymap_size, linux.write(keymap_fd, keymap_text, keymap_size));
+    try app.keyboard.setKeymap(keymap_fd, @intCast(keymap_size));
+    _ = c.xkb_state_update_key(app.keyboard.state.?, 29 + 8, c.XKB_KEY_DOWN); // Ctrl
+
+    for ([_]bool{ false, true }) |kitty| {
+        var stream = app.term.vtStream();
+        defer stream.deinit();
+        if (kitty) stream.nextSlice("\x1b[>3u"); // Disambiguate and report event types.
+        for ([_]bool{ true, false }) |shift| {
+            _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, if (shift) c.XKB_KEY_DOWN else c.XKB_KEY_UP);
+            const keys: []const u32 = if (shift)
+                &.{ 46, 47, 34, 45, 44, 51, 13 } // C, V, G, X, Z, comma, equals
+            else
+                &.{ 13, 12, 11 }; // equals, minus, zero
+            for (keys) |key| {
+                for ([_]vt.input.KeyAction{ .repeat, .release }) |action| {
+                    app.onKey(key, action);
+                    var buf: [64]u8 = undefined;
+                    const n = posix.read(fds[0], &buf) catch |err| switch (err) {
+                        error.WouldBlock => 0,
+                        else => return err,
+                    };
+                    try std.testing.expectEqualStrings("", buf[0..n]);
+                }
+            }
+        }
+        if (kitty) stream.nextSlice("\x1b[<u");
+    }
+
+    // Extra Alt/Super modifiers belong to the app, including all Kitty keyboard event types.
+    // Modifier number = 1 + Shift(1) + Alt(2) + Ctrl(4) + Super(8).
+    {
+        var stream = app.term.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b[>3u");
+        defer stream.nextSlice("\x1b[<u");
+        for ([_]struct { key: u32, extra: u32, shift: bool, codepoint: u8, modifier: u8 }{
+            .{ .key = 12, .extra = 56, .shift = false, .codepoint = '-', .modifier = 7 },
+            .{ .key = 13, .extra = 125, .shift = false, .codepoint = '=', .modifier = 13 },
+            .{ .key = 46, .extra = 56, .shift = true, .codepoint = 'c', .modifier = 8 },
+            .{ .key = 47, .extra = 125, .shift = true, .codepoint = 'v', .modifier = 14 },
+        }) |case| {
+            _ = c.xkb_state_update_key(app.keyboard.state.?, case.extra + 8, c.XKB_KEY_DOWN);
+            defer _ = c.xkb_state_update_key(app.keyboard.state.?, case.extra + 8, c.XKB_KEY_UP);
+            if (case.shift) _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, c.XKB_KEY_DOWN);
+            defer if (case.shift) {
+                _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, c.XKB_KEY_UP);
+            };
+            for ([_]vt.input.KeyAction{ .repeat, .release, .press }) |action| {
+                app.onKey(case.key, action);
+                var buf: [64]u8 = undefined;
+                const n = posix.read(fds[0], &buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                var expected_buf: [64]u8 = undefined;
+                const expected = try std.fmt.bufPrint(&expected_buf, "\x1b[{d};{d}{s}u", .{
+                    case.codepoint, case.modifier,
+                    switch (action) {
+                        .press => "",
+                        .repeat => ":2",
+                        .release => ":3",
+                    },
+                });
+                try std.testing.expectEqualStrings(expected, buf[0..n]);
+            }
+        }
+    }
+
+    // An explicit unbind still passes the same repeated shortcut through.
+    try keybind.put(&app.config.keybinds, alloc, "ctrl+shift+c=unbind");
+    _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, c.XKB_KEY_DOWN);
+    app.onKey(46, .repeat);
+    var buf: [64]u8 = undefined;
+    const unbound_n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings("\x1b[99;6u", buf[0..unbound_n]);
+    // Ordinary Ctrl+C must also continue reaching the application.
+    _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, c.XKB_KEY_UP);
+    app.onKey(46, .repeat);
+    const control_n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings("\x03", buf[0..control_n]);
+}
+
+fn encodeAndWriteKey(self: *App, event: vt.input.KeyEvent) bool {
+    var out_buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&out_buf);
+    vt.input.encodeKey(&writer, event, .fromTerminal(&self.term)) catch |err| {
+        log.err("key encode failed: {}", .{err});
+        return false;
+    };
+    const bytes = writer.buffered();
+    if (bytes.len == 0) return false;
+    self.writePty(bytes);
+    return true;
+}
+
+// Includes headroom for base64 framing of a maximum-sized clipboard read.
+const max_pty_write_queue = 4 * 1024 * 1024;
+
+/// Accept the entire write or drop it before emitting any bytes. Reserve the
+/// possible backlog first so neither backpressure nor OOM truncates a reply.
+fn writePty(self: *App, bytes: []const u8) void {
+    std.debug.assert(self.write_queue_offset <= self.write_queue.items.len);
+    const pending = self.write_queue.items.len - self.write_queue_offset;
+    if (bytes.len > max_pty_write_queue -| pending) {
+        log.warn("pty write queue full; dropping complete write ({d} bytes)", .{bytes.len});
+        return;
+    }
+    // Only move the tail when at least as many bytes have been consumed.
+    // Otherwise grow: compacting after every small drain would be quadratic.
+    if (self.write_queue.capacity - self.write_queue.items.len < bytes.len and
+        self.write_queue_offset >= pending)
+    {
+        std.mem.copyForwards(u8, self.write_queue.items[0..pending], self.write_queue.items[self.write_queue_offset..]);
+        self.write_queue.items.len = pending;
+        self.write_queue_offset = 0;
+    }
+    self.write_queue.ensureUnusedCapacity(self.alloc, bytes.len) catch |err| {
+        log.warn("pty write queue reserve failed: {}", .{err});
+        return;
+    };
+    // A backlog exists; keep ordering by appending behind it.
+    if (pending > 0) {
+        self.write_queue.appendSliceAssumeCapacity(bytes);
+        return;
+    }
+    const written = self.tryPtyWrite(bytes);
+    self.write_queue.appendSliceAssumeCapacity(bytes[written..]);
+}
+
+/// Drain the backlog after the master polled writable.
+fn flushWriteQueue(self: *App) void {
+    self.write_queue_offset += self.tryPtyWrite(self.write_queue.items[self.write_queue_offset..]);
+    if (self.write_queue_offset == self.write_queue.items.len) {
+        self.write_queue.clearRetainingCapacity();
+        self.write_queue_offset = 0;
+    }
+}
+
+/// Write as much as the kernel accepts; returns the number of bytes consumed. Never blocks.
+fn tryPtyWrite(self: *App, bytes: []const u8) usize {
+    const linux = std.os.linux;
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const rc = linux.write(self.pty.master, bytes.ptr + offset, bytes.len - offset);
+        switch (linux.errno(rc)) {
+            .SUCCESS => offset += rc,
+            .INTR => continue,
+            .AGAIN => break,
+            // EIO: child gone; the read side notices and shuts down.
+            .IO => break,
+            else => |err| {
+                log.err("pty write failed: {}", .{err});
+                break;
+            },
+        }
+    }
+    return offset;
+}
+
+test "maximum clipboard response survives write backpressure in order" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.pty.master = fds[1];
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+
+    const clipboard = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(clipboard);
+    @memset(clipboard, 'x');
+    var expected: std.Io.Writer.Allocating = .init(alloc);
+    defer expected.deinit();
+    try formatOsc52ClipboardReport(&expected.writer, 'c', clipboard);
+    try expected.writer.writeAll("following input");
+
+    app.writeOsc52ClipboardReport('c', clipboard);
+    try std.testing.expect(app.write_queue.items.len > 1024 * 1024);
+    app.writePty("following input");
+    var received: usize = 0;
+    var buf: [16 * 1024]u8 = undefined;
+    while (received < expected.written().len) {
+        const n = try posix.read(fds[0], &buf);
+        try std.testing.expect(n > 0);
+        try std.testing.expectEqualSlices(u8, expected.written()[received..][0..n], buf[0..n]);
+        received += n;
+        const queued_len = app.write_queue.items.len;
+        const queued_offset = app.write_queue_offset;
+        app.flushWriteQueue();
+        if (app.write_queue.items.len > 0) {
+            try std.testing.expectEqual(queued_len, app.write_queue.items.len);
+            try std.testing.expect(app.write_queue_offset > queued_offset);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.write_queue_offset);
+}
+
+test "PTY limit and allocation failure reject before writing a prefix" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.pty.master = fds[1];
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+    const oversized = try alloc.alloc(u8, max_pty_write_queue + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+    app.writePty(oversized);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, posix.read(fds[0], &byte));
+    try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
+
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    app.writePty("reply");
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectError(error.WouldBlock, posix.read(fds[0], &byte));
+    try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
+}
+
+test "PTY enqueue counts unread bytes and amortizes compaction" {
+    const alloc = std.testing.allocator;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.write_queue = try .initCapacity(alloc, max_pty_write_queue);
+    defer app.write_queue.deinit(alloc);
+    app.write_queue.items.len = max_pty_write_queue;
+    for (app.write_queue.items, 0..) |*byte, i| byte.* = @truncate(i);
+
+    // A small consumed prefix doesn't trigger a large tail copy, and does
+    // not count against the logical cap. Reserve failure keeps it intact.
+    app.write_queue_offset = 1;
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0, .resize_fail_index = 0 });
+    app.alloc = failing.allocator();
+    app.writePty("x");
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), app.write_queue_offset);
+    try std.testing.expectEqual(@as(usize, max_pty_write_queue), app.write_queue.items.len);
+    app.alloc = alloc;
+    app.writePty("x");
+    try std.testing.expectEqual(@as(usize, 1), app.write_queue_offset);
+    try std.testing.expectEqual(@as(usize, max_pty_write_queue + 1), app.write_queue.items.len);
+    app.writePty("rejected");
+    try std.testing.expectEqual(@as(usize, max_pty_write_queue + 1), app.write_queue.items.len);
+    try std.testing.expectEqual(@as(u8, 'x'), app.write_queue.items[max_pty_write_queue]);
+
+    // With enough consumed bytes, reclaim the prefix instead of growing.
+    app.write_queue.items.len = app.write_queue.capacity;
+    @memset(app.write_queue.items, 0);
+    app.write_queue_offset = app.write_queue.items.len - 4;
+    @memcpy(app.write_queue.items[app.write_queue_offset..], "tail");
+    const capacity = app.write_queue.capacity;
+    app.writePty("next");
+    try std.testing.expectEqual(capacity, app.write_queue.capacity);
+    try std.testing.expectEqual(@as(usize, 0), app.write_queue_offset);
+    try std.testing.expectEqualStrings("tailnext", app.write_queue.items);
+}
+
+const AsyncRenderStart = enum { submitted, no_work, deferred };
+
+fn startAsyncRender(self: *App) !AsyncRenderStart {
+    var async_raster = &(self.async_raster orelse return .deferred);
+    if (async_raster.busy()) return .deferred;
+    const selection_bg = self.selection_bg;
+    const selection_fg = self.selection_fg;
+    if (!async_raster.configuredFor(
+        self.font.discovery(),
+        selection_bg,
+        selection_fg,
+        self.cursor_color,
+        self.cursor_text,
+        self.config.background_opacity,
+        self.config.background_opacity_cells,
+    )) {
+        async_raster.reconfigure(
+            self.font.discovery(),
+            selection_bg,
+            selection_fg,
+            self.cursor_color,
+            self.cursor_text,
+            self.config.background_opacity,
+            self.config.background_opacity_cells,
+        ) catch |err| {
+            self.rasterFatal(err);
+            return .deferred;
+        };
+    }
+    // DEC 2026: mid-update, so re-render the previous snapshot (and overlay/kitty copies)
+    // as-is. Only reachable for geometry redraws; pending rebuilds wait for the freeze to end.
+    const frozen = self.term.modes.get(.synchronized_output);
+    var hyperlink_hints = self.linksActive();
+    // Frozen jobs re-render the previous snapshot at a new geometry, so
+    // they never take the unchanged-overlay shortcut.
+    var overlay_dirty = true;
+    var scroll: ?ScrollDetector.Scroll = null;
+    var old_cursor: vt.RenderState.Cursor = self.render_state.cursor;
+    if (!frozen) {
+        self.syncScrollTarget();
+        if (self.scroll_offset != 0 and
+            (!self.config.smooth_scrolling or scrollbarAtBottom(self.term.screens.active.pages.scrollbar())))
+        {
+            self.resetSmoothScroll();
+        }
+        self.tickKittyAnimations();
+        const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
+        const new_scrollbar = self.currentScrollbarThumb();
+        // Detect before update(): neither the previous nor next frame may have overlays, since
+        // their pixels don't move with terminal rows.
+        if (!self.async_force_full and self.scroll_offset == 0 and self.render_scroll_offset == 0 and
+            !hyperlink_hints and !self.async_job.hyperlink_hints and
+            self.ime_preedit == null and self.async_job.preedit == null and
+            self.async_job.link_hint == null and
+            new_scrollbar == null and self.async_job.scrollbar == null and
+            !has_kitty_graphics and self.async_job.kitty.len == 0)
+        {
+            scroll = try self.scroll_detector.detect(self.alloc, &self.render_state, &self.term);
+        }
+        if (self.async_force_full) {
+            self.render_state.rows = 0;
+            self.render_state.dirty = .full;
+        }
+        old_cursor = self.render_state.cursor;
+        self.render_state.overscan_request = .{ .below = @intFromBool(self.scroll_offset != 0) };
+        try self.render_state.update(self.alloc, &self.term);
+        // Ghostty excludes overscan from cursor.viewport. Our cropped grid
+        // can expose that row, so include its cursor in this render snapshot.
+        if (self.render_state.cursor.viewport == null and self.render_state.overscan.below != 0) {
+            const cursor = self.term.screens.active.cursor;
+            const pin = self.render_state.row_data.items(.pin)[self.render_state.rows];
+            if (pin.node == cursor.page_pin.node and pin.y == cursor.page_pin.y) {
+                const cells = self.render_state.row_data.items(.cells)[self.render_state.rows].items(.raw);
+                self.render_state.cursor.viewport = .{
+                    .x = cursor.x,
+                    .y = self.render_state.rows,
+                    .wide_tail = cursor.x > 0 and cells[cursor.x - 1].wide == .wide,
+                };
+            }
+        }
+        if (self.scroll_offset != self.render_scroll_offset) self.render_state.dirty = .full;
+        self.render_scroll_offset = self.scroll_offset;
+        self.dirtyCursorRows(old_cursor);
+        // If terminal state (not the fade timer) removed the last overlay, redraw its old pixels
+        // rather than repair from a buffer that still holds the thumb.
+        if (self.async_job.scrollbar != null and new_scrollbar == null) {
+            self.render_state.dirty = .full;
+        }
+        if (self.render_state.dirty == .partial and self.allRenderRowsDirty()) {
+            self.render_state.dirty = .full;
+        }
+        // Snapshot overlay inputs; the worker cannot safely read App state.
+        // The previous job's copies are dead: only one job exists at a time.
+        const hovered = if (hyperlink_hints) self.hovered_link else null;
+        const new_link: ?[]const u8 = if (hovered) |link| link.uri else null;
+        const new_range: ?Renderer.LinkRange = if (hovered) |link| link.range else null;
+        const new_preedit: ?[]const u8 = self.ime_preedit;
+        overlay_dirty = hyperlink_hints != self.async_job.hyperlink_hints or
+            !optionalStrEql(self.async_job.preedit, new_preedit) or
+            !optionalStrEql(self.async_job.link_hint, new_link) or
+            !std.meta.eql(self.async_job.link_range, new_range) or
+            !std.meta.eql(self.async_job.scrollbar, new_scrollbar);
+        try self.async_job.replaceOverlays(self.alloc, new_preedit, new_link, new_range, new_scrollbar, hyperlink_hints);
+        var kitty_changed = false;
+        if (has_kitty_graphics) {
+            // Text-only scrolling also dirties the kitty storage. It can
+            // change pixels only when placements exist (or were removed).
+            kitty_changed = self.term.screens.active.kitty_images.dirty != 0;
+            const items = try Renderer.collectKittyPlacements(&self.font, self.alloc, &self.term);
+            if (!Renderer.kittyItemsEqual(self.async_job.kitty, items)) kitty_changed = true;
+            try self.async_job.replaceKitty(self.alloc, &self.kitty_cache, items);
+        } else {
+            if (self.async_job.kitty.len > 0) kitty_changed = true;
+            self.async_job.releaseKitty(self.alloc, &self.kitty_cache);
+        }
+        self.kitty_cache.sweep(self.alloc);
+        // Kitty placements aren't tracked per row: any graphics change, or content change
+        // beneath them, is a full render.
+        if (kitty_changed or (has_kitty_graphics and self.render_state.dirty != .false)) {
+            self.render_state.dirty = .full;
+        }
+        overlay_dirty = overlay_dirty or kitty_changed;
+        if (overlay_dirty or self.render_state.dirty != .full) scroll = null;
+        // Nothing to draw: content is clean and overlay inputs match the previous job. Skip it
+        // rather than burn a job round-trip on an identical frame.
+        if (self.render_state.dirty == .false and !overlay_dirty and !self.geometry_redraw) return .no_work;
+    } else {
+        // Keep link affordances consistent with the stale snapshot.
+        hyperlink_hints = self.async_job.hyperlink_hints;
+        // Full-surface scrollbar coordinates belong to the old geometry. Remove the thumb while
+        // synchronized output holds the old snapshot; new geometry applies after the freeze.
+        if (self.async_job.scrollbar != null) self.render_state.dirty = .full;
+    }
+    std.debug.assert(self.held_frame == null);
+    const target = self.window.acquireRenderTarget() catch |err| {
+        // Overlay snapshots now describe the pending frame; make sure a retry can't mistake
+        // them for unchanged inputs and skip it.
+        self.async_force_full = true;
+        // NotReady is transient. Any other failure means no buffer is obtainable, and retrying
+        // in the pre-poll path would spin forever.
+        if (err != error.NotReady) self.rasterFatal(err);
+        return .deferred;
+    };
+    errdefer self.window.cancelRender(target.buffer);
+    if (scroll != null and target.age != 1 and target.source_pixels == null) scroll = null;
+    if (scroll) |value| self.scroll_detector.prepare(&self.render_state, value, old_cursor);
+    const repair: AsyncRaster.Repair = if (scroll == null)
+        try self.frame_damage.planRepair(
+            target.age,
+            self.render_state.dirty == .full,
+            .{
+                .width = target.width,
+                .height = target.height,
+                .grid_x = self.layout.grid_x,
+                .grid_y = self.layout.grid_y,
+                .grid_width = self.layout.grid_width,
+                .grid_height = self.layout.grid_height,
+                .cell_width = self.font.cell_width,
+                .cell_height = self.font.cell_height,
+            },
+        )
+    else
+        .none;
+    self.async_generation +%= 1;
+    async_raster.submit(.{
+        .pixels = target.pixels,
+        .source_pixels = target.source_pixels,
+        .width = target.width,
+        .height = target.height,
+        .grid_x = self.layout.grid_x,
+        .grid_y = self.layout.grid_y,
+        .grid_width = self.layout.grid_width,
+        .grid_height = self.layout.grid_height,
+        .age = target.age,
+        .generation = self.async_generation,
+        .focused = self.focused,
+        .hyperlink_hints = hyperlink_hints,
+        .link_range = self.async_job.link_range,
+        .preedit = self.async_job.preedit,
+        .link_hint = self.async_job.link_hint,
+        .scrollbar = if (frozen) null else self.async_job.scrollbar,
+        .kitty_items = self.async_job.kitty,
+        .overlay_dirty = overlay_dirty,
+        .scroll_shift = if (scroll) |value| value.shift else null,
+        .scroll_offset = @min(self.render_scroll_offset, self.font.cell_height - 1),
+        .repair = repair,
+    }) catch |err| {
+        self.window.cancelRender(target.buffer);
+        self.kitty_cache.sweep(self.alloc);
+        self.rasterFatal(err);
+        return .deferred;
+    };
+    if (!frozen) self.term.screens.active.kitty_images.dirty = 0;
+    if (!frozen) self.async_force_full = false;
+    return .submitted;
+}
+
+fn tickKittyAnimations(self: *App) void {
+    const now_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+    const now_ms: u64 = @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
+    const delay_ms = self.term.screens.active.kitty_images.animationTick(self.io, now_ms);
+    const spec: std.os.linux.itimerspec = if (delay_ms) |delay| .{
+        .it_value = timespecFromNs(@max(delay, 1) *| std.time.ns_per_ms),
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    } else disarmed_timer;
+    _ = setTimer(self.kitty_animation_fd, spec, "kitty animation");
+}
+
+fn optionalStrEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// A finished frame is waiting and the compositor is ready for it.
+fn canCommitHeldFrame(self: *const App) bool {
+    if (self.held_frame == null) return false;
+    return !self.window.frame_pending and !self.window.suspended;
+}
+
+/// Dirty content can start a frame now. A frame may start while a frame callback is
+/// outstanding; it is refused only while the raster worker starts up or a target is checked out.
+fn hasContentRedraw(self: *App) bool {
+    if (!self.needs_redraw) return false;
+    // DEC 2026 freezes content frames, but geometry changes still
+    // repaint (the frozen snapshot at the new size).
+    if (self.term.modes.get(.synchronized_output) and !self.geometry_redraw) return false;
+    if (self.window.width == 0 or self.window.suspended) return false;
+    if (self.window.rendering_pending) return false;
+    if (self.async_raster == null) return false;
+    return true;
+}
+
+/// Must be true exactly when redrawIfNeeded will make progress, or the pre-poll fast
+/// path in run() spins without reading the display socket.
+fn hasReadyRedraw(self: *App) bool {
+    return self.canCommitHeldFrame() or self.hasContentRedraw();
+}
+
+fn redrawIfNeeded(self: *App) !void {
+    if (self.canCommitHeldFrame()) self.commitHeldFrame();
+    if (!self.hasContentRedraw()) return;
+    switch (try self.startAsyncRender()) {
+        .submitted, .no_work => {
+            self.needs_redraw = false;
+            self.geometry_redraw = false;
+        },
+        .deferred => {},
+    }
+}
+
+/// Commit a finished frame that was held for the frame callback, unless
+/// the window geometry changed while it waited.
+fn commitHeldFrame(self: *App) void {
+    const buffer = self.held_frame orelse return;
+    self.held_frame = null;
+    if (buffer.width != Window.physicalDimension(self.window.width, self.window.scale120) or
+        buffer.height != Window.physicalDimension(self.window.height, self.window.scale120))
+    {
+        self.window.cancelRender(buffer);
+        self.frame_damage.invalidate();
+        self.async_force_full = true;
+        self.needs_redraw = true;
+        return;
+    }
+    self.commitFinishedFrame(buffer);
+}
+
+/// Commit an async-rendered buffer using the current frame's damage
+/// entry. Commit failures are fatal: the surface is unusable.
+fn commitFinishedFrame(self: *App, buffer: *Window.Buffer) void {
+    const surface_damage = self.frame_damage.currentSurfaceDamage(buffer.height) catch |err| {
+        log.err("async surface damage failed: {}", .{err});
+        self.window.cancelRender(buffer);
+        self.window.fatal_error = err;
+        self.window.running = false;
+        return;
+    };
+    self.window.commitRender(buffer, surface_damage) catch |err| {
+        log.err("async commit failed: {}", .{err});
+        self.window.cancelRender(buffer);
+        self.window.fatal_error = err;
+        self.window.running = false;
+        return;
+    };
+    self.startDbus();
+}
+
+/// The raster worker is the only renderer; a load failure is fatal.
+fn startAsyncRasterLoad(self: *App) void {
+    std.debug.assert(self.async_raster == null and self.async_raster_loader == null);
+
+    self.async_raster_loader = AsyncRaster.Loader.init(
+        self.font.discovery(),
+        self.selection_bg,
+        self.selection_fg,
+        self.cursor_color,
+        self.cursor_text,
+        self.config.background_opacity,
+        self.config.background_opacity_cells,
+        &self.render_state,
+    ) catch |err| {
+        self.rasterFatal(err);
+        return;
+    };
+    if (self.async_raster_loader) |*loader| {
+        loader.start() catch |err| {
+            loader.deinit();
+            self.async_raster_loader = null;
+            self.rasterFatal(err);
+        };
+    }
+}
+
+fn finishAsyncRasterLoad(self: *App) void {
+    var loader = &(self.async_raster_loader orelse return);
+    const result = loader.takeResult() orelse return;
+    loader.deinit();
+    self.async_raster_loader = null;
+
+    switch (result) {
+        .failed => |err| self.rasterFatal(err),
+        .ready => |ready| {
+            var raster = ready;
+            if (!raster.configuredFor(
+                self.font.discovery(),
+                self.selection_bg,
+                self.selection_fg,
+                self.cursor_color,
+                self.cursor_text,
+                self.config.background_opacity,
+                self.config.background_opacity_cells,
+            )) {
+                // Config changed while loading; rebuild with the new one.
+                raster.deinit();
+                self.startAsyncRasterLoad();
+                return;
+            }
+
+            self.async_raster = raster;
+            if (self.async_raster) |*async_raster| {
+                async_raster.start() catch |err| {
+                    async_raster.deinit();
+                    self.async_raster = null;
+                    self.rasterFatal(err);
+                    return;
+                };
+            }
+            // Content may have gone dirty while the worker was loading.
+            self.needs_redraw = true;
+        },
+    }
+}
+
+/// The app cannot render without the raster worker; stop with the error.
+fn rasterFatal(self: *App, err: anyerror) void {
+    log.err("raster worker unavailable: {}", .{err});
+    self.window.fatal_error = err;
+    self.window.running = false;
+}
+
+fn finishAsyncRender(self: *App) void {
+    var async_raster = &(self.async_raster orelse return);
+    const result = async_raster.takeResult() orelse return;
+    const buffer = self.findRenderingBuffer(result.job.pixels) orelse {
+        self.needs_redraw = true;
+        return;
+    };
+    if (result.err) |err| {
+        self.window.cancelRender(buffer);
+        self.async_job.releaseKitty(self.alloc, &self.kitty_cache);
+        self.kitty_cache.sweep(self.alloc);
+        // A deterministic raster error would retry forever; with no other
+        // renderer to fall back to, stop.
+        self.rasterFatal(err);
+        return;
+    }
+    if (result.job.generation != self.async_generation or
+        self.window.suspended or
+        result.job.width != Window.physicalDimension(self.window.width, self.window.scale120) or
+        result.job.height != Window.physicalDimension(self.window.height, self.window.scale120))
+    {
+        self.window.cancelRender(buffer);
+        self.async_force_full = true;
+        self.needs_redraw = true;
+        return;
+    }
+    if (result.damage == .none) {
+        // The target may have been repaired, but it matches the current
+        // surface. Do not advance frame history unless a commit does.
+        self.window.cancelRender(buffer);
+        self.clearRenderDirty();
+        self.syncTextInputCursorRect(&self.render_state);
+        return;
+    }
+    self.frame_damage.begin(.{
+        .width = result.job.width,
+        .height = result.job.height,
+        .grid_x = result.job.grid_x,
+        .grid_y = result.job.grid_y,
+        .grid_width = result.job.grid_width,
+        .grid_height = result.job.grid_height,
+        .cell_width = self.font.cell_width,
+        .cell_height = self.font.cell_height,
+    });
+    self.frame_damage.record(async_raster, result.damage) catch |err| {
+        log.err("async damage bookkeeping failed: {}", .{err});
+        self.window.cancelRender(buffer);
+        self.window.fatal_error = err;
+        self.window.running = false;
+        return;
+    };
+    self.clearRenderDirty();
+    self.syncTextInputCursorRect(&self.render_state);
+    if (self.window.frame_pending) {
+        // Compositor not ready for another commit: hold the buffer; redrawIfNeeded commits it on
+        // the frame callback and immediately starts the next render so raster overlaps the wait.
+        std.debug.assert(self.held_frame == null);
+        self.held_frame = buffer;
+        return;
+    }
+    self.commitFinishedFrame(buffer);
+}
+
+fn redrawReady(ctx: *anyopaque) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    self.needs_redraw = true;
+}
+
+fn findRenderingBuffer(self: *App, pixels: []u32) ?*Window.Buffer {
+    for (self.window.buffers.items) |buffer| {
+        if (buffer.rendering and buffer.pixels().ptr == pixels.ptr) return buffer;
+    }
+    return null;
+}
+
+fn allRenderRowsDirty(self: *const App) bool {
+    return allStateRowsDirty(&self.render_state);
+}
+
+fn allStateRowsDirty(state: *const vt.RenderState) bool {
+    const rows: usize = state.rows;
+    if (rows == 0) return false;
+    for (state.row_data.items(.dirty)[0..rows]) |dirty| {
+        if (!dirty) return false;
+    }
+    return true;
+}
+
+fn syncTextInputCursorRect(self: *App, state: *const vt.RenderState) void {
+    if (!self.ime_focused) return;
+    self.window.setTextInputCursorRect(self.textInputCursorRect(state));
+}
+
+fn textInputCursorRect(self: *App, state: *const vt.RenderState) Window.TextInputRect {
+    const cursor = state.cursor.viewport;
+    const x_cells: u32 = if (cursor) |cpos| @intCast(cpos.x -| @intFromBool(cpos.wide_tail)) else 0;
+    const y_cells: u32 = if (cursor) |cpos| @intCast(cpos.y) else 0;
+    return physicalRectToLogical(self.window.scale120, .{
+        .x = @intCast(self.layout.grid_x + x_cells * self.font.cell_width),
+        .y = @intCast(self.layout.grid_y + (y_cells * self.font.cell_height -| self.render_scroll_offset)),
+        .width = @intCast(self.font.cell_width),
+        .height = @intCast(self.font.cell_height),
+    });
+}
+
+fn currentCursorState(self: *const App) *const vt.RenderState {
+    return &self.render_state;
+}
+
+fn physicalRectToLogical(scale120: u32, rect: Window.TextInputRect) Window.TextInputRect {
+    return .{
+        .x = scaledPhysicalToLogical(scale120, rect.x),
+        .y = scaledPhysicalToLogical(scale120, rect.y),
+        .width = @max(1, scaledPhysicalToLogical(scale120, rect.width)),
+        .height = @max(1, scaledPhysicalToLogical(scale120, rect.height)),
+    };
+}
+
+fn scaledPhysicalToLogical(scale120: u32, value: i32) i32 {
+    return @intCast(@divTrunc(@as(i64, value) * 120 + @divTrunc(@as(i64, scale120), 2), @as(i64, scale120)));
+}
+
+fn dirtyCursorRows(self: *App, old_cursor: vt.RenderState.Cursor) void {
+    dirtyCursorRowsForState(&self.render_state, old_cursor);
+}
+
+fn dirtyCursorRowsForState(state: *vt.RenderState, old_cursor: vt.RenderState.Cursor) void {
+    const new_cursor = state.cursor;
+    if (old_cursor.visible == new_cursor.visible and
+        old_cursor.visual_style == new_cursor.visual_style and
+        std.meta.eql(old_cursor.viewport, new_cursor.viewport))
+    {
+        return;
+    }
+
+    dirtyCursorRowInState(state, old_cursor.viewport);
+    dirtyCursorRowInState(state, new_cursor.viewport);
+}
+
+fn dirtyCursorRowInState(state: *vt.RenderState, viewport: ?vt.RenderState.Cursor.Viewport) void {
+    const row = viewport orelse return;
+    if (row.y >= state.row_data.len) return;
+
+    state.row_data.items(.dirty)[row.y] = true;
+    if (state.dirty == .false) state.dirty = .partial;
+}
+
+fn clearRenderDirty(self: *App) void {
+    clearStateDirty(&self.render_state);
+}
+
+fn clearStateDirty(state: *vt.RenderState) void {
+    const rows = state.row_data.slice();
+    for (rows.items(.dirty)) |*dirty| dirty.* = false;
+    state.dirty = .false;
+}
+
+/// Renderer-only state changed: invalidate any in-flight snapshot without touching
+/// RenderState while the worker may read it; startAsyncRender rebuilds once it's idle.
+fn requestFullAsyncRedraw(self: *App) void {
+    self.invalidateAsyncFrame();
+    self.needs_redraw = true;
+}
+
+fn invalidateAsyncFrame(self: *App) void {
+    self.async_generation +%= 1;
+    self.async_force_full = true;
+    // A held frame was rastered from the now-stale state; drop it rather
+    // than commit outdated pixels on the next frame callback.
+    if (self.held_frame) |buffer| {
+        self.held_frame = null;
+        self.window.cancelRender(buffer);
+        self.frame_damage.invalidate();
+        self.needs_redraw = true;
+    }
+}
+
+/// Window resize delegate: fit the grid to the new size, resize the
+/// terminal (reflow) and tell the child.
+fn resize(ctx: *anyopaque, width: u31, height: u31) anyerror!void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    return self.resizeForConfig(width, height, self.config);
+}
+
+fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror!void {
+    const layout = TerminalLayout.init(
+        width,
+        height,
+        self.font.cell_width,
+        self.font.cell_height,
+        physicalPadding(config, self.window.scale120),
+    );
+    const layout_changed = !std.meta.eql(layout, self.layout);
+    self.layout = layout;
+    const cols = layout.columns;
+    const rows = layout.rows;
+    const grid_width_px = layout.grid_width;
+    const grid_height_px = layout.grid_height;
+    const terminal_width_px = std.math.mul(u32, cols, self.font.cell_width) catch std.math.maxInt(u32);
+    const terminal_height_px = std.math.mul(u32, rows, self.font.cell_height) catch std.math.maxInt(u32);
+    const pixels_changed = terminal_width_px != self.term.width_px or terminal_height_px != self.term.height_px;
+    const cells_changed = cols != self.term.cols or rows != self.term.rows;
+    if (!cells_changed and !pixels_changed and !layout_changed) return;
+
+    self.stopFling();
+    self.resetSmoothScroll();
+    if (cells_changed or pixels_changed) {
+        if (cells_changed) log.debug("resize to {d}x{d} cells", .{ cols, rows });
+        try self.term.resize(self.alloc, .{
+            .cols = cols,
+            .rows = rows,
+            .cell_size_px = .{
+                .width = self.font.cell_width,
+                .height = self.font.cell_height,
+            },
+        });
+    }
+    try self.pty.setWinsize(.{
+        .row = rows,
+        .col = cols,
+        .xpixel = @intCast(grid_width_px),
+        .ypixel = @intCast(grid_height_px),
+    });
+    if (self.term.modes.get(.in_band_size_reports)) self.sendSizeReport();
+    self.geometry_redraw = true;
+    self.needs_redraw = true;
+    self.syncScrollbarHover();
+    self.syncHoveredLink(true);
+}
+
+test "scrollbar geometry maps viewport rows across the track" {
+    const layout = TerminalLayout.init(100, 100, 10, 10, .{});
+    const top = scrollbarGeometry(.{ .total = 100, .offset = 0, .len = 20 }, 0, layout, 120, scrollbar_default_alpha).?;
+    const middle = scrollbarGeometry(.{ .total = 100, .offset = 40, .len = 20 }, 0, layout, 120, scrollbar_default_alpha).?;
+    const bottom = scrollbarGeometry(.{ .total = 100, .offset = 80, .len = 20 }, 0, layout, 120, scrollbar_default_alpha).?;
+
+    try std.testing.expectEqual(@as(u31, 91), top.thumb.x);
+    try std.testing.expectEqual(@as(u31, 6), top.thumb.width);
+    try std.testing.expectEqual(@as(u31, 24), top.thumb.height);
+    try std.testing.expectEqual(@as(f64, 3), top.thumb.y);
+    try std.testing.expectEqual(@as(f64, 38), middle.thumb.y);
+    try std.testing.expectEqual(@as(f64, 73), bottom.thumb.y);
+    try std.testing.expectEqual(@as(usize, 0), scrollbarRowForThumbY(top, 3));
+    try std.testing.expectEqual(@as(usize, 40), scrollbarRowForThumbY(top, 38));
+    try std.testing.expectEqual(@as(usize, 80), scrollbarRowForThumbY(top, 73));
+    try std.testing.expect(scrollbarAtBottom(.{ .total = 100, .offset = 80, .len = 20 }));
+    try std.testing.expect(!scrollbarAtBottom(.{ .total = 100, .offset = 79, .len = 20 }));
+    try std.testing.expect(scrollbarShouldRender(.{ .total = 100, .offset = 80, .len = 20 }, scrollbar_default_alpha));
+    try std.testing.expect(scrollbarShouldRender(.{ .total = 100, .offset = 80, .len = 20 }, scrollbar_hover_alpha));
+    try std.testing.expect(!scrollbarShouldRender(.{ .total = 20, .offset = 0, .len = 20 }, scrollbar_hover_alpha));
+    try std.testing.expect(!scrollbarShouldRender(.{ .total = 100, .offset = 40, .len = 20 }, 0));
+    try std.testing.expect(scrollbarGeometry(.{ .total = 20, .offset = 0, .len = 20 }, 0, layout, 120, scrollbar_default_alpha) == null);
+}
+
+test "scrollbar preserves partial rows and subpixel thumb positions" {
+    const layout = TerminalLayout.init(100, 100, 10, 10, .{});
+    // A 70 px track travel over 80 rows gives 0.875 px per row. Neither
+    // a partial row nor the resulting fraction of a pixel may be rounded.
+    for ([_]struct { row: usize, fraction: f64, y: f64 }{
+        .{ .row = 39, .fraction = 0.75, .y = 37.78125 },
+        .{ .row = 40, .fraction = 0, .y = 38 },
+        .{ .row = 40, .fraction = 0.25, .y = 38.21875 },
+        .{ .row = 80, .fraction = 0.75, .y = 73 },
+    }) |case| {
+        const geometry = scrollbarGeometry(.{ .total = 100, .offset = case.row, .len = 20 }, case.fraction, layout, 120, scrollbar_default_alpha).?;
+        try std.testing.expectEqual(case.y, geometry.thumb.y);
+    }
+}
+
+test "semantic command output extracts most recent completed output" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 20, .rows = 6 });
+    defer term.deinit(alloc);
+
+    try term.semanticPrompt(.init(.fresh_line_new_prompt));
+    try term.printString("$ ");
+    try term.semanticPrompt(.init(.end_prompt_start_input));
+    try term.printString("printf");
+    try term.semanticPrompt(.init(.end_input_start_output));
+    term.carriageReturn();
+    try term.linefeed();
+    try term.printString("one");
+    term.carriageReturn();
+    try term.linefeed();
+    try term.printString("two");
+    try term.semanticPrompt(.init(.end_command));
+    term.carriageReturn();
+    try term.linefeed();
+    try term.semanticPrompt(.init(.fresh_line_new_prompt));
+    try term.printString("$ ");
+
+    const output = semanticCommandOutputText(alloc, term.screens.active).?;
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings("one\ntwo", output);
+}
+
+test "scrollback keys require supported modifiers on the primary screen" {
+    var config: Config = .{};
+    defer config.keybinds.deinit(std.testing.allocator);
+    const shifted: vt.input.KeyMods = .{ .shift = true };
+    const ctrl_shifted: vt.input.KeyMods = .{ .shift = true, .ctrl = true };
+    try std.testing.expectEqual(
+        KeyBindingAction{ .lines = -1 },
+        keyBindingAction(&config, .primary, .{ .key = .arrow_up, .mods = shifted }).?,
+    );
+    try std.testing.expectEqual(
+        KeyBindingAction{ .lines = 1 },
+        keyBindingAction(&config, .primary, .{ .key = .arrow_down, .mods = shifted }).?,
+    );
+    try std.testing.expectEqual(
+        KeyBindingAction.page_up,
+        keyBindingAction(&config, .primary, .{ .key = .page_up, .mods = shifted }).?,
+    );
+    try std.testing.expectEqual(
+        KeyBindingAction.page_down,
+        keyBindingAction(&config, .primary, .{ .key = .page_down, .mods = shifted }).?,
+    );
+    try std.testing.expectEqual(
+        KeyBindingAction.top,
+        keyBindingAction(&config, .primary, .{ .key = .home, .mods = shifted }).?,
+    );
+    try std.testing.expectEqual(
+        KeyBindingAction.bottom,
+        keyBindingAction(&config, .primary, .{ .key = .end, .mods = shifted }).?,
+    );
+
+    try std.testing.expectEqual(
+        KeyBindingAction.passthrough,
+        keyBindingAction(&config, .alternate, .{ .key = .arrow_up, .mods = shifted }).?,
+    );
+    try std.testing.expectEqual(
+        null,
+        keyBindingAction(&config, .primary, .{ .key = .arrow_up, .mods = ctrl_shifted }),
+    );
+    try std.testing.expectEqual(
+        null,
+        keyBindingAction(&config, .primary, .{ .key = .page_up }),
+    );
+    try std.testing.expectEqual(
+        null,
+        keyBindingAction(&config, .primary, .{
+            .key = .page_up,
+            .mods = ctrl_shifted,
+        }),
+    );
+
+    try config.set(std.testing.allocator, "keybind", "ctrl+shift+up=scroll_page_lines:-5");
+    try config.set(std.testing.allocator, "keybind", "shift+up=unbind");
+    try std.testing.expectEqual(
+        KeyBindingAction{ .lines = -5 },
+        keyBindingAction(&config, .primary, .{ .key = .arrow_up, .mods = ctrl_shifted }).?,
+    );
+    try std.testing.expectEqual(
+        KeyBindingAction.passthrough,
+        keyBindingAction(&config, .primary, .{ .key = .arrow_up, .mods = shifted }).?,
+    );
+}
+
+test "custom scrolling overrides fixed chords and passes through on the alternate screen" {
+    var config: Config = .{};
+    defer config.keybinds.deinit(std.testing.allocator);
+    const cases = [_]struct { binding: []const u8, event: vt.input.KeyEvent }{
+        .{ .binding = "ctrl+shift+c=scroll_page_lines:-3", .event = .{ .key = .key_c, .unshifted_codepoint = 'c', .mods = .{ .ctrl = true, .shift = true } } },
+        .{ .binding = "ctrl+==scroll_page_lines:-3", .event = .{ .key = .equal, .unshifted_codepoint = '=', .mods = .{ .ctrl = true } } },
+        .{ .binding = "shift+PageUp=scroll_page_lines:-3", .event = .{ .key = .page_up, .mods = .{ .shift = true } } },
+    };
+    for (cases) |case| {
+        try config.set(std.testing.allocator, "keybind", case.binding);
+        for ([_]vt.input.KeyAction{ .press, .repeat, .release }) |action| {
+            var event = case.event;
+            event.action = action;
+            try std.testing.expectEqual(KeyBindingAction{ .lines = -3 }, keyBindingAction(&config, .primary, event).?);
+            try std.testing.expectEqual(KeyBindingAction.passthrough, keyBindingAction(&config, .alternate, event).?);
+        }
+    }
+    try config.set(std.testing.allocator, "keybind", "ctrl+shift+c=unbind");
+    try std.testing.expectEqual(KeyBindingAction.passthrough, keyBindingAction(&config, .primary, cases[0].event).?);
+}
+
+test "stopping the read pipeline preserves final PTY output" {
+    const Collector = struct {
+        bytes: [256]u8 = undefined,
+        len: usize = 0,
+
+        fn nextSlice(self: *@This(), value: []const u8) void {
+            @memcpy(self.bytes[self.len..][0..value.len], value);
+            self.len += value.len;
+        }
+    };
+
+    const linux = std.os.linux;
+    var pipe_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        .SUCCESS,
+        linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true, .NONBLOCK = true })),
+    );
+    defer _ = linux.close(pipe_fds[0]);
+    defer _ = linux.close(pipe_fds[1]);
+
+    var pipeline: ReadPipeline = try .init(pipe_fds[0]);
+    defer pipeline.deinit();
+    try pipeline.start();
+
+    const expected = "output written immediately before child exit";
+    const written = linux.write(pipe_fds[1], expected.ptr, expected.len);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(written));
+    try std.testing.expectEqual(expected.len, written);
+
+    // Model the SIGCHLD path: stop may win before the gather thread reads, after it publishes,
+    // or in between. Both stores drain in order so no final bytes are lost.
+    pipeline.stop();
+    var collector: Collector = .{};
+    while (pipeline.take()) |batch| {
+        collector.nextSlice(batch);
+        pipeline.release();
+    }
+    _ = try drainPtyTail(pipe_fds[0], &collector);
+
+    try std.testing.expectEqualStrings(expected, collector.bytes[0..collector.len]);
+}

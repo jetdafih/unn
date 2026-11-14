@@ -1,0 +1,30 @@
+.{
+    .name = .unn,
+    .version = "0.1.0",
+    .fingerprint = 0xfc0f79dfa974556c,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .ghostty = .{
+            // vt-1.0.1: includes the ED3 kitty-placement fix (ghostty-org/ghostty#14831)
+            // and RenderState overscan support (ghostty-org/ghostty#14400).
+            .url = "git+https://github.com/ghostty-org/ghostty?ref=vt-1.0.1#6d9577708a211b0e6c5e6c6886f3cfb7efc47555",
+            .hash = "ghostty-1.4.1-dev-5UdBC5KEpgWrtWgPv-b88tzg1U_twe94iPwedj_T9p2x",
+        },
+        .wayland = .{
+            .url = "git+https://codeberg.org/ifreund/zig-wayland#fc7672f661874aa2015fc19a87ebabce787cf1c7",
+            .hash = "wayland-0.7.0-lQa1kuP8AQD5dW7_o-VKLVD_QbqXe7Zob78r2su7Pyex",
+        },
+        .z2d = .{
+            .url = "git+https://github.com/vancluever/z2d#2db3eb9048075c5d5aa487b4e34ab57c34ddc203",
+            .hash = "z2d-0.13.3-pre-j5P_HoIVFACQXDdvUbZg7fw5bcJagBqfZBjAMDNCrjAk",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "dist",
+        "protocols",
+        "src",
+        "vendor",
+    },
+}

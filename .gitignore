@@ -1,0 +1,13 @@
+.zig-cache/
+zig-out/
+zig-pkg/
+release/
+zig-out-musl/
+dist/staging/
+dist/*.tar.gz
+packaging/arch/pkg/
+packaging/arch/src/
+packaging/arch/*.pkg.tar.zst
+packaging/arch/PKGBUILD
+packaging/arch/PKGBUILD.source
+packaging/arch/PKGBUILD.git

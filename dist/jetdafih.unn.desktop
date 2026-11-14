@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Unn
+Comment=Wayland terminal emulator
+Icon=jetdafih.unn
+Exec=unn
+Terminal=false
+StartupNotify=true
+Categories=System;TerminalEmulator;
+X-TerminalArgExec=-e
+X-TerminalArgDir=--working-directory=

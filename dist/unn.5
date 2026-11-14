@@ -1,0 +1,451 @@
+.TH UNN 5 "2026-07-14" "unn" "File Formats Manual"
+.SH NAME
+unn \- configuration file format
+.SH DESCRIPTION
+.B unn
+reads configuration from
+.I $XDG_CONFIG_HOME/unn/unn.ini
+or, when
+.B XDG_CONFIG_HOME
+is unset, from
+.IR $HOME/.config/unn/unn.ini .
+An alternate file may be selected with
+.BR unn (1)'s
+.B \-\-config
+option.
+On first run a complete default file is written to the default path.
+An unreadable file falls back to the built-in defaults.
+.SH TERMINAL COMPATIBILITY
+Unn uses Ghostty's
+.B libghostty-vt
+terminal core and identifies itself through its installed
+.B unn
+terminfo entry.
+.SH SYNTAX
+The file contains one
+.I key = value
+entry per line.
+Leading and trailing horizontal whitespace is ignored.
+Empty lines and lines whose first non-whitespace character is
+.B #
+are comments.
+Unknown keys, malformed lines, and invalid values are reported and ignored;
+the previous value or default remains in effect.
+.PP
+Entries may be grouped under
+.I [section]
+headers.
+A header names a group and applies to every following entry until the next
+header; it does not need to be closed.
+Section names are case-insensitive.
+Inside a section an entry first tries the
+.RI section - key
+spelling, so
+.B [font]
+with
+.B family
+sets
+.BR font-family .
+When no such key exists it falls back to the bare key, so
+.B [colors]
+with
+.B background
+still sets
+.BR background .
+.PP
+For example:
+.EX
+[font]
+family = Iosevka
+size = 12.5
+
+[window]
+padding-x = 4,8
+
+[colors]
+background = #1a1b26
+foreground = #c0caf5
+regular1 = #f7768e
+bright4 = #7aa2f7
+.EE
+.SH RELOADING
+Press
+.B Ctrl+Shift+,
+or send
+.B SIGUSR1
+to reload the configuration.
+Overrides supplied with
+.B \-o
+are reapplied after the file is loaded.
+.PP
+Visual and interaction settings apply to the running window.
+The
+.BR command
+and
+.B scrollback-limit
+settings describe resources created at startup and do not replace or move an
+existing child or resize existing scrollback storage.
+.SH GENERAL SETTINGS
+.TP
+.BI command " = command"
+Set the child command used when no command is supplied on the command line.
+An unprefixed value, or one prefixed with
+.BR shell: ,
+is passed to
+.BR /bin/sh " " \-c .
+A value prefixed with
+.B direct:
+is split on spaces and tabs and executed directly; shell quoting is not
+interpreted in direct mode.
+When unset,
+.B SHELL
+and then
+.B /bin/sh
+are used.
+.TP
+.BI pipe-command-output " = command"
+Set a shell command that receives the last OSC 133-delimited command output on
+standard input when
+.B Ctrl+Shift+G
+is pressed.
+The default is unset.
+.TP
+.BI working-directory " = path"
+Start the child in
+.IR path ,
+which must be absolute,
+.BR ~ ,
+or begin with
+.BR ~/ .
+When unset, the child inherits Unn's working directory.
+If the directory cannot be used, Unn warns and inherits its own directory.
+The
+.B \-\-working-directory
+option overrides this setting.
+.SH COMMAND COMPLETION NOTIFICATIONS
+The shell must emit OSC 133 C/D command-start/end markers. Unn does not
+automatically inject shell integration. These settings do not affect explicit
+OSC 9/777 desktop notifications.
+.TP
+.BI notify-on-command-finish " = never|unfocused|always"
+Choose when completed commands can notify. The default is
+.BR never .
+With
+.BR unfocused ,
+focus is checked when the command finishes. Alternate-screen use does not
+cancel timing, so an editor session can notify when it exits.
+.TP
+.BI notify-on-command-finish-action " = actions"
+Comma-separated
+.B bell
+and
+.B notify
+flags, optionally prefixed with
+.BR no- .
+Each assignment starts from the default: bell enabled, desktop notification
+disabled. For desktop notifications only, use
+.BR no-bell,notify .
+The bell uses the compositor's optional system-bell protocol; desktop
+notifications require D-Bus and a notification service.
+.TP
+.BI notify-on-command-finish-after " = duration"
+Notify only when command duration strictly exceeds this value. The default is
+.BR 5s .
+Use nonnegative integers followed immediately by
+.BR y , w , d , h , m , s , ms , us , "µs" ,
+or
+.BR ns .
+Components may be combined, such as
+.B 1m30s
+or
+.BR "1s 250ms" .
+A bare
+.B 0
+disables the minimum duration; fractional numbers are not accepted.
+Values saturate at the maximum unsigned 64-bit count of nanoseconds.
+.SH FONT SETTINGS
+.TP
+.BI font-family " = family"
+Set the primary font family requested from fontconfig.
+The default is
+.BR monospace .
+Define a virtual family in the user's Fontconfig configuration to provide
+ordered primary, styled, and fallback fonts specific to Unn, then select it
+with this setting.
+.TP
+.BI font-size " = size[pt|px]"
+Set the font size.
+Bare values and
+.B pt
+values are typographic points;
+.B px
+values are logical pixels before Wayland output scaling.
+Fractional values greater than zero and no greater than 512 are accepted.
+The default is
+.BR 12pt ,
+equivalent to 16 logical pixels at 96 DPI.
+.TP
+.BI adjust-cell-height " = pixels|percent%"
+Adjust the height derived from the font metrics.
+A signed integer adds or removes physical pixels; a percentage scales the
+natural height.
+For example,
+.B 2
+adds two pixels,
+.B -2
+removes two pixels, and
+.B 20%
+increases the natural height by twenty percent.
+The result is at least one pixel, and glyphs remain vertically centered.
+Pixel adjustments stay fixed while zooming or changing output scale;
+percentage adjustments follow the font metrics.
+By default no adjustment is applied.
+.TP
+.BI adjust-box-thickness " = pixels|percent%"
+.TQ
+.BI adjust-underline-thickness " = pixels|percent%"
+.TQ
+.BI adjust-strikethrough-thickness " = pixels|percent%"
+.TQ
+.BI adjust-overline-thickness " = pixels|percent%"
+.TQ
+.BI adjust-cursor-thickness " = pixels|percent%"
+Adjust the line thickness of box drawing and other built-in line sprites,
+underlines, strikethrough, overlines, or the bar, underline, and hollow
+cursors.
+All of them start from the font's underline thickness, rounded up to whole
+pixels.
+Values take the same form as
+.BR adjust-cell-height ,
+and the result is at least one pixel.
+Line positions are computed before the adjustment.
+By default no adjustment is applied.
+.SH WINDOW SETTINGS
+.TP
+.BI background-opacity " = opacity"
+Set the opacity of cells using the default terminal background.
+The value is between 0 and 1 inclusive; the default is 1.
+By default, explicit cell backgrounds, selections, cursors, text, and terminal
+graphics retain their own opacity.
+.TP
+.BI background-opacity-cells " = boolean"
+Apply
+.B background-opacity
+to explicit cell background colors too.
+The default is false.
+Selections, cursors, text, and terminal graphics retain their own opacity.
+.TP
+.BI window-padding-x " = pixels[,pixels]"
+Set minimum left and right padding in logical pixels.
+One value applies to both sides; two values set left and right independently.
+The default is zero.
+.TP
+.BI window-padding-y " = pixels[,pixels]"
+Set minimum top and bottom padding in logical pixels.
+One value applies to both sides; two values set top and bottom independently.
+The default is zero.
+.TP
+.BI window-height " = rows"
+Set the initial terminal grid height in cells.
+Takes effect only together with
+.BR window-width .
+The default is zero, which leaves the size unset.
+Values below 4 are raised to 4.
+.TP
+.BI window-width " = columns"
+Set the initial terminal grid width in cells.
+Takes effect only together with
+.BR window-height .
+The default is zero, which leaves the size unset.
+Values below 10 are raised to 10.
+.B \-\-window-size-chars
+sets both settings, and
+.B \-\-window-size-pixels
+takes precedence over them.
+Reloading does not resize an existing window.
+.SH STORAGE AND INPUT SETTINGS
+.TP
+.BI image-storage-limit " = bytes"
+Set the kitty graphics image-data limit per terminal screen.
+The default is 320000000 bytes and the maximum is 4294967295.
+Zero disables the kitty graphics protocol.
+.TP
+.BI inertial-scrolling " = true|false"
+Choose whether precision-device scrolling continues with inertial motion after
+the fingers are lifted.
+The default is
+.BR true .
+.TP
+.BI mouse-scroll-multiplier " = multiplier"
+Apply one multiplier to both precision-device and discrete-wheel scrolling.
+Finite values are clamped to the range 0.01 through 10000.
+.TP
+.BI mouse-scroll-multiplier " = precision:value,discrete:value"
+Set the two scrolling multipliers independently.
+Either named component may be updated without changing the other.
+The defaults are
+.B precision:1
+and
+.BR discrete:3 .
+.TP
+.BI keybind " = trigger=action"
+Add or replace a Ghostty-style single-key binding. Repeat this setting to bind
+multiple triggers. Repeating the same trigger replaces its previous binding;
+an invalid entry leaves previous bindings unchanged.
+.B scroll_page_lines:N
+scrolls by N terminal lines: negative values scroll up, positive values scroll
+down, and zero consumes the key without moving. N must be between -32768 and
+32767.
+.B unbind
+removes a shortcut and passes its input to the application.
+.PP
+The default line-scrolling bindings are:
+.nf
+keybind = shift+up=scroll_page_lines:-1
+keybind = shift+down=scroll_page_lines:1
+.fi
+.PP
+For example, add a five-line shortcut and remove the default up shortcut:
+.nf
+keybind = ctrl+shift+k=scroll_page_lines:-5
+keybind = shift+up=unbind
+.fi
+.PP
+Triggers accept lowercase
+.BR shift ,
+.B ctrl
+(alias
+.BR control ),
+.B alt
+(aliases
+.BR opt ", " option ),
+or
+.B super
+(aliases
+.BR cmd ", " command )
+with one key. A single Unicode character follows the keyboard layout;
+key names such as
+.BR KeyK ", " arrow_up ", " PageUp ", " equal
+select physical keys. The aliases
+.BR up ", " down ", " left ", " right
+are also accepted. Modifiers match exactly, ignoring lock keys and modifier
+sides. Include Shift when held to produce punctuation; on a US keyboard,
+.B ctrl+shift++=scroll_page_lines:-5
+binds Ctrl+Shift+Plus. Use
+.B ctrl+==scroll_page_lines:-5
+to bind Ctrl+Equals.
+.PP
+Configured bindings take priority over fixed shortcuts and apply immediately
+on configuration reload. Scroll actions pass through on the alternate screen.
+Only
+.B scroll_page_lines
+and
+.B unbind
+actions are supported; sequences, binding flags and other Ghostty actions are
+not supported.
+.TP
+.BI scrollback-limit " = bytes"
+Set the terminal page-storage limit, including the active screen.
+The default is 50000000 bytes.
+.SH COLOR SETTINGS
+Colors use six hexadecimal RGB digits, with an optional leading
+.BR # .
+For example,
+.B #ffe629
+and
+.B ffe629
+are equivalent.
+.B cursor
+and
+.B cursor-text
+also accept
+.B cell-foreground
+and
+.B cell-background
+to match the cursor cell's colors at runtime.
+.PP
+Runtime OSC color changes may override terminal, cursor, and selection colors
+until they are reset by the application.
+.TP
+.BI background " = color"
+Set the default terminal background.
+The built-in default is
+.BR #292929 .
+.TP
+.BI bright0 " = color"
+through
+.BI bright7 " = color"
+Set the bright ANSI palette colors (indices 8-15).
+.TP
+.BI cursor " = color"
+Set the cursor color.
+A direct color uses six hexadecimal RGB digits, with an optional leading
+.BR # .
+The special values
+.B cell-foreground
+and
+.B cell-background
+match the cursor cell's foreground or background, after reverse video.
+An OSC 12 cursor color from the application overrides this until it is reset.
+The built-in default is
+.BR #ffffff .
+.TP
+.BI cursor-text " = color"
+Set text beneath a focused block cursor.
+Accepts the same values as
+.BR cursor .
+When unset, the terminal background is used.
+The usual pairing with
+.B cursor = cell-foreground
+is
+.BR "cursor-text = cell-background" .
+.TP
+.BI foreground " = color"
+Set the default terminal foreground.
+The built-in default is
+.BR #ffffff .
+.TP
+.BI regular0 " = color"
+through
+.BI regular7 " = color"
+Set the regular ANSI palette colors (indices 0-7).
+.TP
+.BI selection-background " = color"
+Set the selection background.
+The built-in default is
+.BR #0f6cbd .
+.TP
+.BI selection-foreground " = color"
+Set selected text.
+The built-in default is
+.BR #ffffff .
+.SH ENVIRONMENT
+.TP
+.B HOME
+Fallback base directory when
+.B XDG_CONFIG_HOME
+is unset.
+.TP
+.B SHELL
+Default child command when
+.B command
+is unset.
+.TP
+.B XDG_CONFIG_HOME
+Base directory for the configuration file.
+.SH FILES
+.TP
+.I $HOME/.config/unn/unn.ini
+Fallback configuration file.
+.TP
+.I $XDG_CONFIG_HOME/unn/unn.ini
+Default configuration file.
+.TP
+.I $XDG_CONFIG_HOME/fontconfig/conf.d/50-unn.conf
+Optional per-user virtual family definition for Unn-specific font
+preferences.
+.TP
+.I share/doc/unn/examples/50-unn.conf
+Annotated Fontconfig template, relative to the installation prefix.
+.SH SEE ALSO
+.BR unn (1)

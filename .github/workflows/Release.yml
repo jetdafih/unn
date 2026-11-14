@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        run: |
+          zig="zig-$(uname -m)-linux-${ZIG_VERSION}"
+          curl -fsSLo zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/${zig}.tar.xz"
+          tar -xf zig.tar.xz
+          echo "$PWD/${zig}" >> "$GITHUB_PATH"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libwayland-dev libxkbcommon-dev \
+            libfontconfig1-dev libfreetype6-dev libharfbuzz-dev \
+            ncurses-bin ca-certificates curl xz-utils
+
+      - name: Build (glibc)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Package (glibc)
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: ./packaging/package-release.sh gnu zig-out "${TAG#v}"
+
+      - name: Build (musl)
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          docker run --rm \
+            --volume "$PWD:/src" \
+            --workdir /src \
+            --env ZIG_VERSION="$ZIG_VERSION" \
+            --env TAG="$TAG" \
+            alpine:3.24 sh -eux -c '
+              apk add --no-cache \
+                build-base binutils pkgconf git curl xz \
+                wayland-dev \
+                fontconfig-dev freetype-dev harfbuzz-dev libxkbcommon-dev \
+                ncurses
+              curl -fsSLo /tmp/zig.tar.xz \
+                "https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz"
+              tar -C /tmp -xf /tmp/zig.tar.xz
+              export PATH="/tmp/zig-$(uname -m)-linux-$ZIG_VERSION:$PATH"
+              zig build -Doptimize=ReleaseFast --prefix zig-out-musl
+              ./packaging/package-release.sh musl zig-out-musl "${TAG#v}"
+            '
+          sudo chown -R "$(id -u):$(id -g)" zig-out-musl release .zig-cache
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.runner }}
+          path: release/*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd release && sha256sum *.tar.gz > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS
+          generate_release_notes: true
